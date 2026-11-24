@@ -274,7 +274,7 @@ C1/C4 在 4KB vs 2MB 页、表自身 4KB vs 2MB 映射下复测,记录 Δdtlb/op
 ### 5.1 CSV schema
 
 ```csv
-arch,variant,enc,tag,base,isa,case,param,rep,
+arch,variant,enc,tag,base,isa,w,case,param,rep,
   direct_cyc,conv_cyc,n_ops, direct_ins,conv_ins,
   direct_l1m,conv_l1m, direct_l2m,conv_l2m, direct_llcm,conv_llcm,
   direct_dtlb,conv_dtlb, freq_mhz
