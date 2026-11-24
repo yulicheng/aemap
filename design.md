@@ -131,7 +131,7 @@ or    rdx, rax              ; VA(低 32 来自 off,高 32 来自表项,[63:52] �
 ```
 
 **fast(运行时约定 tag≡0)— 4 条,3 有效 uop:** 删除 `and` 行。tag 为零时 `shr` 后即为干净 idx。
-若 tag 可能非零,fast 版会以 `tag<<3` 偏移寻址到错误表项甚至越界,**必须只在 tag≡0 契约下使用**。
+若 tag 可能非零,`shr rsi,32` 后 tag 残留在 rsi[31:20],经 ×8 寻址放大为 `tag<<23` 的偏移,会命中表外错误地址甚至越界——**fast 版必须只在 tag≡0 契约下使用**。
 
 **逐条开销(Intel Skylake+ / Zen3+,典型):**
 
@@ -202,7 +202,7 @@ ARM 没有绝对 disp32 寻址,基址必须先入寄存器:
 
 | 策略 | 额外指令 | 说明 |
 |---|---|---|
-| **寄存器驻留(默认)** | 0 | 编译加 `-ffixed-x27`,汇编模板内**字面引用** `x27`;x27 为 callee-saved 且非平台保留寄存器。已验证 GCC 与 clang |
+| **寄存器驻留(默认)** | 0 | 编译加 `-ffixed-x27`,汇编模板内**字面引用** `x27`;x27 为 callee-saved 且非平台保留寄存器。clang 已实测验证(附录 A);GCC 的 `-ffixed-*` 为标准文档化选项 |
 | 每访问物化 | +2(仅孤立访问) | `adrp x16, sym; add x16, x16, :lo12:sym`;循环内会被外提,摊薄为 0 |
 | 全局寄存器变量 | 0 | `register ... asm("x27")` 仅 GCC 支持(clang 直接报错,附录 A),不推荐作为唯一方案 |
 
@@ -349,7 +349,7 @@ static void vva_tbl_init(void) {
 | `BASE` | `pinned` / `mat` / `abs`(仅 x86) | pinned |
 | `ISA` | x86: `v1` / `v3`(BMI2);ARM: `armv8-a` | v1 / armv8-a |
 
-关键编译选项:寄存器驻留构建加 `-ffixed-r15`(x86,仅 GCC;x86-64 clang 不支持)或 `-ffixed-x27`(AArch64,GCC/clang 均支持);绝对寻址构建需 `-fno-pie`(编译)+ `-no-pie`(链接)+ `-mcmodel=small`。无保留寄存器时回退到操作数物化形式(循环内摊薄为 0,附录 A)。
+关键编译选项:寄存器驻留构建加 `-ffixed-r15`(x86,仅 GCC;x86-64 clang 不支持)或 `-ffixed-x27`(AArch64,clang 已验证、GCC 为标准选项);绝对寻址构建需 `-fno-pie`(编译)+ `-no-pie`(链接)+ `-mcmodel=small`。无保留寄存器时回退到操作数物化形式(循环内摊薄为 0,附录 A)。
 
 ---
 
@@ -364,7 +364,7 @@ static void vva_tbl_init(void) {
 | `pf` 表项预取 | 两者 | 对下一访问的表项 `prefetcht0`/`prfm`(地址序列预生成,软件流水) | 表 miss 高的顺序/跨段模式 |
 | `cache` 段缓存 | 两者 | `idx == last` 时跳过查表(分支预测型) | idx 高度重复(C2/C3 类) |
 | `gs` GS-base | 仅 x86 | 段不切换期间把基址写入 GS base,访存用 `%gs:off32`,**0 条转换指令**;切换时 `wrgsbase`(~20-40c,需 FSGSBASE + 内核 ≥5.9;glibc TLS 占用 FS,故用 GS) | 段粘性强的吞吐场景 |
-| 纯 C 版 | 两者 | `((uint64_t)map[(vva>>32)&0xFFFFF]<<32) | (uint32_t)vva` 交编译器生成 | 对照:验证手写序列是否优于编译器(索引必须掩码 tag) |
+| 纯 C 版 | 两者 | `((uint64_t)map[(vva>>32)&0xFFFFF]<<32) \| (uint32_t)vva` 交编译器生成 | 对照:验证手写序列是否优于编译器(索引必须掩码 tag) |
 
 补充:**非 volatile 的 `vva2va_pure()`**(无 `"memory"` clobber)允许编译器对相同输入做 CSE,适合一个基本块内多次访问同一指针的代码;默认 volatile 版本语义安全。
 
@@ -431,6 +431,7 @@ static void vva_tbl_init(void) {
 | x86-64 绝对寻址变体 | `gcc -fno-pie -no-pie`,`movq map(,%rdi,8)` | 汇编/运行正确(结果 0x1ffff00000007) |
 | AArch64 strict/fast 语法与条数 | `clang --target=aarch64-linux-gnu -O2 -S` | strict 4 条(UBFX/LDR/UBFX/ORR-LSL)、fast 3 条,操作数合法 |
 | AArch64 驻留模式 | `-ffixed-x27` + 字面 `x27` | 无 x27 保存/恢复,4 条 |
-| 编译器兼容性 | clang 21 | 不支持全局寄存器变量(AArch64 直接报错);x86-64 不支持 `-ffixed-*`(GCC 支持);AArch64 支持 `-ffixed-x27` |
+| AArch64 驻留寄存器初始化(§5.3) | `mov x27, %0` 构造器片段,clang 交叉汇编 | 通过 |
+| 编译器兼容性 | clang 21 | 全局寄存器变量在 x86-64 与 AArch64 上均直接报错(仅 GCC 支持);x86-64 不支持 `-ffixed-*`(GCC 支持);AArch64 支持 `-ffixed-x27` |
 
 说明:AArch64 仅完成语法/指令数/语义级验证,动态正确性由 test.md C0 在目标机执行把关;x86-64 已完成动态运行验证(含 tag 扰动)。
