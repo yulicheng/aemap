@@ -1,7 +1,7 @@
 # design.md — VVA→VA 动态地址映射设计(x86-64 / AArch64)
 
 > 依据 `readme.md`:设计一种软件动态地址映射,将应用指针(VVA)在每次 `ld/st` 前通过内联查表转换为真实虚地址(VA),并用最优指令序列实现。
-> 本文档描述实现方式;测试框架与测试用例见 `test.md`(两种架构**转换代码分架构实现**,测试框架与用例完全共享)。
+> 本文档描述实现方式;测试框架与测试用例见 `test.md`(两种架构**转换代码分架构实现**,测试框架与用例完全共享)。关键序列已实际验证,见附录 A。
 
 ---
 
@@ -37,7 +37,7 @@ VA = (map[VVA[51:32]] << 32) | VVA[31:0]
 | 参数 | 含义 | 取值 |
 |---|---|---|
 | `VVA_IDX_BITS` | 索引宽度 | 固定 20(readme:位 51:32) |
-| `VVA_HIGH_BITS`(W) | 表项产生的 VA 高位宽度 | ≤ 20;readme 字面语义为 VA[48:32],即 **W = 17** 为默认;上限受平台约束(见 §1.4) |
+| `VVA_HIGH_BITS`(W) | 表项产生的 VA 高位宽度 | ≤ 20;readme 字面语义为 VA[48:32](W = 17),canonical 48 位 VA 实际上限为 15/16(见 §1.4);**读法约定见 §1.6**,代码序列与 W 无关 |
 | 表项数 | 2^20 | 每项存 VA 高位 H,高位补零 |
 
 **表项约定**:H 一律存放在表项低位、高位补零(A 编码存 32 位字,B 编码存 `H<<32`)。这样**合并指令的位宽与 W 无关**,W 只影响表内容合法性,不影响代码生成。
@@ -58,9 +58,9 @@ VA = (map[VVA[51:32]] << 32) | VVA[31:0]
 
 | 平台 | 用户态可用 W 上限 | 说明 |
 |---|---|---|
-| x86-64,4 级页表 | 15(VA[46:32]) | 用户 VA < 2^47 |
+| x86-64,4 级页表 | 15(VA[46:32]) | 用户 VA < 2^47,bit 47 恒 0 |
 | x86-64,5 级页表(LA57) | 20(VA[51:32]) | 满足"52 位新地址" |
-| AArch64,48 位 VA | 16(VA[47:32]) | |
+| AArch64,48 位 VA | 16(VA[47:32]) | TTBR0/TTBR1 在 2^48 处拆分 |
 | AArch64,ARMv8.2-LVA(52 位 VA) | 20(VA[51:32]) | 满足"52 位新地址" |
 
 构建时按平台 clamp W;`vva_map_set()` 对越界 H 断言失败。W=17(readme 字面值)要求 LA57 / LVA 平台。
@@ -68,6 +68,18 @@ VA = (map[VVA[51:32]] << 32) | VVA[31:0]
 ### 1.5 保留值
 
 `map[idx] == 0` 保留为"未映射"哨兵(转换结果落在低端 4GB,约定不可解引用)。分支无关的实现不做运行时检查,安全性由段分配器保证(见 §7)。
+
+### 1.6 对 readme 字面表述的读法约定
+
+readme 有两处表述需要在实现中显式约定(只影响表内容合法性,不影响任何指令序列):
+
+1. **"48 位虚地址动态映射到 52 位新的地址"**:本设计取"真实 VA 为 48 位,应用可见的新地址空间为 52 位",即 VVA = 20 位索引 + 32 位 offset(位 0~51 全部有意义),tag 仅占 [63:52]。
+2. **"将 VVA 高 51 到 32 位转换成真实的 VA 的高 48 到 32 位"**:字面为 17 位(VA[48:32]),但 48 位 VA 的高位区间实际是 [47:32](16 位),两者相差 1 位。处理方式:
+   - **代码与 W 无关**(表项高位补零,`bfi` 固定插入 20 位、`or` 合并天然清零高位),因此该歧义不影响最优序列;
+   - 严格按 canonical 48 位 VA 实现:W = 15(x86-64 L4)/ 16(AArch64 48 位 VA);
+   - 按 readme 字面:W = 17,需 LA57 / ARMv8.2-LVA;
+   - 按"52 位新地址"取满:W = 20,同样需 LA57 / LVA。
+   - 框架默认 W = 17(字面),按平台 clamp(§1.4),并在测试结果中记录 W。
 
 ---
 
@@ -99,9 +111,10 @@ VA = (map[VVA[51:32]] << 32) | VVA[31:0]
 
 | 策略 | 额外指令 | 说明 |
 |---|---|---|
-| **寄存器驻留(默认)** | 0 | `register uint64_t *tbl asm("r15")` + `-ffixed-r15`;r15 为 callee-saved,与动态库 ABI 兼容 |
-| 绝对寻址 | 0 | `-no-pie -mcmodel=small`:`mov rax,[abs sym + rsi*8]`(SIB base=101 的 disp32 绝对形式) |
-| 每访问物化 | +1 | `lea rbx,[rip+sym]`(PIE 下的编译器默认行为,作对照变体) |
+| **寄存器驻留(默认)** | 0 | 编译加 `-ffixed-r15`,汇编模板内**字面引用** `%r15`;r15 为 callee-saved,与 ABI 兼容。已验证 GCC;clang 21 x86-64 不支持 `-ffixed-*`(附录 A) |
+| 全局寄存器变量 | 0 | `register uint64_t *tbl asm("r15")`,仅 GCC 支持(附录 A) |
+| 绝对寻址 | 0 | `-fno-pie -no-pie -mcmodel=small`:`mov rax,sym(,%rsi,8)`(SIB base=101 的 disp32 绝对形式,已验证) |
+| 每访问物化 | +1(仅孤立访问) | 表基址作为 `"r"` 操作数;循环内 `lea` 会被 LICM 外提到循环外 → 摊薄为 0(已验证) |
 
 ### 3.2 最优指令序列
 
@@ -133,36 +146,45 @@ or    rdx, rax              ; VA(低 32 来自 off,高 32 来自表项,[63:52] �
 - **关键路径**(表 L1 热):strict ≈ 1+1+5+1 = **8 cycles**,fast ≈ **7 cycles**,之后才是真正的 ld/st。
 - **吞吐受限场景**(流式访存,ALU 端口有余量):额外 3~4 uop 大多被隐藏,预期净增 1~3 cycles/访问。
 
-### 3.3 参考实现(GCC 内联汇编)
+### 3.3 参考实现(GCC / clang 内联汇编)
 
 ```c
 /* arch/x86_64/vva_impl.h —— 默认 B8 编码 */
 extern uint64_t vva_map8[VVA_MAP_SIZE] __attribute__((aligned(64))); /* 表项 = H<<32 */
 
-#if defined(VVA_BASE_PINNED)
-register uint64_t *vva_tbl asm("r15");   /* 需 -ffixed-r15 */
-#define VVA_TBL vva_tbl
-#else
-#define VVA_TBL (vva_map8)
-#endif
-
-/* strict:tag 任意;fast:删除 and 行(需 tag≡0 契约) */
+#if defined(VVA_BASE_PINNED)          /* 编译: -ffixed-r15(GCC;x86-64 clang 不支持) */
 static inline void *vva2va(uint64_t vva) {
     uint64_t off, va;
     __asm__ volatile (
-        "movl  %k[in], %k[off]             \n\t"  /* off = VVA[31:0] */
-        "shr   $32, %[in]                  \n\t"  /* in  = VVA[63:32] */
-        "and   $0xFFFFF, %k[in]            \n\t"  /* in  = idx,忽略 tag */
-        "movq  (%[tbl],%[in],8), %[va]     \n\t"  /* va  = H<<32 */
-        "orq   %[off], %[va]               \n\t"  /* va  = VA */
+        "movl  %k[in], %k[off]         \n\t"  /* off = VVA[31:0] */
+        "shr   $32, %[in]              \n\t"  /* in  = VVA[63:32] */
+        "and   $0xFFFFF, %k[in]        \n\t"  /* in  = idx,忽略 tag */
+        "movq  (%%r15,%[in],8), %[va]  \n\t"  /* 字面引用 r15:va = H<<32 */
+        "orq   %[off], %[va]           \n\t"  /* va  = VA */
         : [va] "=&r"(va), [off] "=&r"(off), [in] "+r"(vva)
-        : [tbl] "r"(VVA_TBL)
+        :
         : "memory");
     return (void *)va;
 }
+#else                                  /* 基址作为操作数,由编译器物化/外提 */
+static inline void *vva2va(uint64_t vva) {
+    uint64_t off, va;
+    __asm__ volatile (
+        "movl  %k[in], %k[off]             \n\t"
+        "shr   $32, %[in]                  \n\t"
+        "and   $0xFFFFF, %k[in]            \n\t"
+        "movq  (%[tbl],%[in],8), %[va]     \n\t"
+        "orq   %[off], %[va]               \n\t"
+        : [va] "=&r"(va), [off] "=&r"(off), [in] "+r"(vva)
+        : [tbl] "r"(vva_map8)
+        : "memory");
+    return (void *)va;
+}
+#endif
+/* fast 模式:删除 and 行(需 tag≡0 契约) */
 ```
 
-注:`%k` 为 GCC x86 32 位子寄存器修饰符;`"=&r"` 早消失约束防止与输入共用寄存器;`"memory"` 阻止编译器跨越表更新重排(表静态时可用非 volatile 版本换取 CSE,见 §6)。
+注:`%k` 为 32 位子寄存器修饰符;`"=&r"` 早消失约束防止与输入共用寄存器;`"memory"` 阻止编译器跨越表更新重排(表静态时可用非 volatile 版本换取 CSE,见 §6)。驻留模式的寄存器初始化见 §5.3。
 
 ### 3.4 微架构注意事项
 
@@ -180,8 +202,9 @@ ARM 没有绝对 disp32 寻址,基址必须先入寄存器:
 
 | 策略 | 额外指令 | 说明 |
 |---|---|---|
-| **寄存器驻留(默认)** | 0 | `register uint32_t *tbl asm("x27")` + `-ffixed-x27`(x27 非 ABI 保留寄存器,callee-saved) |
-| 每访问物化 | +2 | `adrp x16, sym; add x16, x16, :lo12:sym`(对照变体) |
+| **寄存器驻留(默认)** | 0 | 编译加 `-ffixed-x27`,汇编模板内**字面引用** `x27`;x27 为 callee-saved 且非平台保留寄存器。已验证 GCC 与 clang |
+| 每访问物化 | +2(仅孤立访问) | `adrp x16, sym; add x16, x16, :lo12:sym`;循环内会被外提,摊薄为 0 |
+| 全局寄存器变量 | 0 | `register ... asm("x27")` 仅 GCC 支持(clang 直接报错,附录 A),不推荐作为唯一方案 |
 
 ### 4.2 最优指令序列
 
@@ -214,19 +237,26 @@ bfi   x0, x2, #32, #20          ; x0[51:32] ← x2[19:0],保留 x0[31:0]
 | `ldr w,[x27,x1,lsl #2]` | ≈4(L1) | L2≈13,L3≈30-50,DRAM≈100-250 |
 | `orr lsl #32` / `bfi` | 1 | |
 
-### 4.3 参考实现(GCC 内联汇编)
+### 4.3 参考实现(GCC / clang 内联汇编)
 
 ```c
 /* arch/aarch64/vva_impl.h —— 默认 A4 编码 */
 extern uint32_t vva_map4[VVA_MAP_SIZE] __attribute__((aligned(64))); /* 表项 = H */
 
-#if defined(VVA_BASE_PINNED)
-register uint32_t *vva_tbl asm("x27");   /* 需 -ffixed-x27 */
-#define VVA_TBL vva_tbl
+#if defined(VVA_BASE_PINNED)          /* 编译: -ffixed-x27(GCC 与 clang 均支持) */
+static inline void *vva2va(uint64_t vva) {
+    uint64_t va, idx, base, off;
+    __asm__ volatile (
+        "ubfx  %[idx], %[vva], #32, #20             \n\t"
+        "ldr   %w[base], [x27, %[idx], lsl #2]      \n\t"  /* 字面引用 x27 */
+        "ubfx  %[off], %[vva], #0, #32              \n\t"
+        "orr   %[va], %[off], %[base], lsl #32      \n\t"
+        : [va] "=&r"(va), [idx] "=&r"(idx), [base] "=&r"(base), [off] "=&r"(off)
+        : [vva] "r"(vva)
+        : "memory");
+    return (void *)va;
+}
 #else
-#define VVA_TBL (vva_map4)
-#endif
-
 static inline void *vva2va(uint64_t vva) {
     uint64_t va, idx, base, off;
     __asm__ volatile (
@@ -235,10 +265,11 @@ static inline void *vva2va(uint64_t vva) {
         "ubfx  %[off], %[vva], #0, #32              \n\t"
         "orr   %[va], %[off], %[base], lsl #32      \n\t"
         : [va] "=&r"(va), [idx] "=&r"(idx), [base] "=&r"(base), [off] "=&r"(off)
-        : [vva] "r"(vva), [tbl] "r"(VVA_TBL)
+        : [vva] "r"(vva), [tbl] "r"(vva_map4)
         : "memory");
     return (void *)va;
 }
+#endif
 ```
 
 ### 4.4 微架构注意事项
@@ -246,6 +277,7 @@ static inline void *vva2va(uint64_t vva) {
 - `ldr w` 零扩展是 `orr`/`bfi` 正确性的前提(表项高位补零约定,§1.2)。
 - B8 编码在 AArch64 无收益:`ldr x` + `orr`(无移位)与 A4 strict 同为 4 条,表却翻倍——这就是默认选 A4 的原因;仍保留为 C13 变体实测。
 - `bfi` 版关键路径与 `orr` 版相同;`orr` 版的第二条 `ubfx` 与 `ldr` 并行,对乱序核更稳,故 strict 用 `orr` 版。
+- x27 为 callee-saved,跨函数调用安全;但不要与平台保留寄存器(x18 等)混淆。
 
 ---
 
@@ -289,12 +321,22 @@ void  vva_prefetch(uint64_t vva);                 /* 可选:prefetcht0 / prfm */
 #endif
 ```
 
-### 5.3 表初始化 API
+### 5.3 表初始化与驻留寄存器初始化
 
 ```c
 void vva_map_init(void);                       /* 全表清零 + 预映射 */
 void vva_map_set(uint32_t idx, uint32_t H);    /* A4: map4[idx]=H; B8: map8[idx]=(uint64_t)H<<32 */
                                                /* 断言 H < (1u << VVA_HIGH_BITS) 且 ≤ 平台上限 */
+
+/* VVA_BASE_PINNED 构建:启动时初始化保留寄存器(配合 -ffixed-r15 / -ffixed-x27) */
+__attribute__((constructor))
+static void vva_tbl_init(void) {
+#if defined(__x86_64__)
+    __asm__ volatile ("movq %0, %%r15" :: "r"((uint64_t)vva_map8) : "r15");
+#elif defined(__aarch64__)
+    __asm__ volatile ("mov x27, %0" :: "r"((uint64_t)vva_map4));
+#endif
+}
 ```
 
 ### 5.4 构建矩阵
@@ -307,7 +349,7 @@ void vva_map_set(uint32_t idx, uint32_t H);    /* A4: map4[idx]=H; B8: map8[idx]
 | `BASE` | `pinned` / `mat` / `abs`(仅 x86) | pinned |
 | `ISA` | x86: `v1` / `v3`(BMI2);ARM: `armv8-a` | v1 / armv8-a |
 
-关键编译选项:寄存器驻留构建加 `-ffixed-r15`(x86)或 `-ffixed-x27`(AArch64);绝对寻址构建加 `-no-pie -mcmodel=small`。
+关键编译选项:寄存器驻留构建加 `-ffixed-r15`(x86,仅 GCC;x86-64 clang 不支持)或 `-ffixed-x27`(AArch64,GCC/clang 均支持);绝对寻址构建需 `-fno-pie`(编译)+ `-no-pie`(链接)+ `-mcmodel=small`。无保留寄存器时回退到操作数物化形式(循环内摊薄为 0,附录 A)。
 
 ---
 
@@ -318,11 +360,11 @@ void vva_map_set(uint32_t idx, uint32_t H);    /* A4: map4[idx]=H; B8: map8[idx]
 | `fast` | 两者 | 约定 tag≡0,省 1 条 | 任何场景 −1 insn / −1 cycle |
 | `enc` 互换 | 两者 | x86→A4 / ARM→B8 | 实测验证 §2.2 的取舍 |
 | `bextr`(v3) | x86 | 提取压缩为 1 条(控制值常驻寄存器) | −1 uop,视微架构 |
-| `mat` 基址物化 | 两者 | 每访问 `lea`/`adrp+add` | 无收益,仅作为"无寄存器驻留"的现实对照 |
+| `mat` 基址物化 | 两者 | 每访问 `lea`/`adrp+add` | 循环内摊薄为 0;仅孤立访问有代价 |
 | `pf` 表项预取 | 两者 | 对下一访问的表项 `prefetcht0`/`prfm`(地址序列预生成,软件流水) | 表 miss 高的顺序/跨段模式 |
 | `cache` 段缓存 | 两者 | `idx == last` 时跳过查表(分支预测型) | idx 高度重复(C2/C3 类) |
 | `gs` GS-base | 仅 x86 | 段不切换期间把基址写入 GS base,访存用 `%gs:off32`,**0 条转换指令**;切换时 `wrgsbase`(~20-40c,需 FSGSBASE + 内核 ≥5.9;glibc TLS 占用 FS,故用 GS) | 段粘性强的吞吐场景 |
-| 纯 C 版 | 两者 | `((uint64_t)map[vva>>32]<<32)|(uint32_t)vva` 交编译器生成 | 对照:验证手写序列是否优于编译器 |
+| 纯 C 版 | 两者 | `((uint64_t)map[(vva>>32)&0xFFFFF]<<32) | (uint32_t)vva` 交编译器生成 | 对照:验证手写序列是否优于编译器(索引必须掩码 tag) |
 
 补充:**非 volatile 的 `vva2va_pure()`**(无 `"memory"` clobber)允许编译器对相同输入做 CSE,适合一个基本块内多次访问同一指针的代码;默认 volatile 版本语义安全。
 
@@ -348,7 +390,7 @@ void vva_map_set(uint32_t idx, uint32_t H);    /* A4: map4[idx]=H; B8: map8[idx]
 |---|---|---|
 | strict + pinned | 5 条(4 有效 uop) | 4 条 |
 | fast + pinned | 4 条(3 有效 uop) | 3 条 |
-| + 每访问物化基址 | +1(`lea rip`) | +2(`adrp+add`) |
+| + 每访问物化基址 | +1(`lea`,仅孤立访问;循环内摊薄 0) | +2(`adrp+add`,同上) |
 | 编码互换 | A4:+1(`shl`) | B8:±0(表 ×2) |
 
 ### 8.2 延迟模型
@@ -372,3 +414,23 @@ void vva_map_set(uint32_t idx, uint32_t H);    /* A4: map4[idx]=H; B8: map8[idx]
 | DRAM(全冷) | +100~250 c | 视 MLP 并发度 |
 
 指令数增量必须与 §8.1 精确一致(框架硬校验);两架构同用例横向对比由共享框架直接产出。
+
+---
+
+## 附录 A:实现验证记录(2026-11-25)
+
+环境:GCC 15.2.0(x86-64);Clang 21.1.8(AArch64 交叉汇编,无交叉运行环境)。
+
+| 验证项 | 方法 | 结果 |
+|---|---|---|
+| x86-64 strict 正确性 | 10^6 随机 (idx, offset, tag∈[0,2^12)),对参考 C 实现 | 0 失配;tag 不变性 0 违例 |
+| x86-64 fast 正确性 | 同上,tag≡0 | 0 失配 |
+| x86-64 指令条数 | `gcc -O2 -S` | strict 5 条 / fast 4 条,与 §3.2 一致 |
+| x86-64 驻留模式 | `-ffixed-r15` + 字面 `%r15` | 5 条,无 `lea`;功能正确 |
+| x86-64 物化开销外提 | `gcc -O2 -S` 观察循环内核 | `lea map(%rip)` 位于循环外(§3.1 修正依据) |
+| x86-64 绝对寻址变体 | `gcc -fno-pie -no-pie`,`movq map(,%rdi,8)` | 汇编/运行正确(结果 0x1ffff00000007) |
+| AArch64 strict/fast 语法与条数 | `clang --target=aarch64-linux-gnu -O2 -S` | strict 4 条(UBFX/LDR/UBFX/ORR-LSL)、fast 3 条,操作数合法 |
+| AArch64 驻留模式 | `-ffixed-x27` + 字面 `x27` | 无 x27 保存/恢复,4 条 |
+| 编译器兼容性 | clang 21 | 不支持全局寄存器变量(AArch64 直接报错);x86-64 不支持 `-ffixed-*`(GCC 支持);AArch64 支持 `-ffixed-x27` |
+
+说明:AArch64 仅完成语法/指令数/语义级验证,动态正确性由 test.md C0 在目标机执行把关;x86-64 已完成动态运行验证(含 tag 扰动)。
