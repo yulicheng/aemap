@@ -434,3 +434,14 @@ static void vva_tbl_init(void) {
 | 编译器兼容性 | clang 21 | 全局寄存器变量在 x86-64 与 AArch64 上均直接报错(仅 GCC 支持);x86-64 不支持 `-ffixed-*`(GCC 支持);AArch64 支持 `-ffixed-x27` |
 
 说明:AArch64 仅完成语法/指令数/语义级验证,动态正确性由 test.md C0 在目标机执行把关;x86-64 已完成动态运行验证(含 tag 扰动)。验证用例的 H 取值(17~20 位)仅用于检验位运算语义与零扩展行为,不涉及 VA 合法性;实际配置按 §1.6 裁定取默认 W = 16。
+
+### A.1 框架实测补充约束(2026-11-25,Ubuntu glibc 2.39 / GCC 15.2.0 / clang 21.1.8)
+
+| 验证项 | 方法 | 结果 |
+|---|---|---|
+| glibc 启动路径与 %r15 冲突 | 构造器内 `vva_tbl_pin()` + `__libc_start_main` 实测 | **构造器内写 %r15 会 SIGSEGV(call 0)**:glibc 的 call_init 用 %r15 保存 init_array 迭代指针跨构造器传递。pinned 构建改为 main() 入口显式调用 `vva_tbl_pin()`(libc 启动路径结束后);构造器形式仅以 `VVA_TBL_CTOR` opt-in(src/vva_map.c) |
+| `bextr` 立即数形式编码 | `gcc -O2 -S` + 实机执行 | gas 对 `bextr $imm` 生成 **XOP 编码**(AMD 专用),Intel 执行 SIGILL;v3 变体必须用寄存器形式,控制字 = `(len<<8)|start = 0x1420`,控制值作为常量操作数已被编译器外提到循环外(循环内严格 4 条) |
+| mat 变体基址物化外提 | `objdump -d` 观察 k_read_c | `lea`(x86)/ GOT 基址载入(AArch64)均被 LICM 外提到循环外,循环内 Δins 与 pinned 相同,§8.1 的"+1 条"仅孤立访问成立 |
+| x86-64 clang 兼容性 | 全变体矩阵构建 | 不支持 `-ffixed-r15`,pinned 自动回退 mat(make 告警);abs/pure/seg/fast/enc 互换均构建 + C0 通过 |
+| AArch64 指令数契约静态断言 | `-ffreestanding` 交叉编译 + `_Static_assert` | strict 4 / fast 3 在编译期强制(含 B8 互换与 SEG 构建豁免),bench/arm_smoke.c |
+| Δins/op 双实例对称性 | `make codegen` 对比 k_read_d / k_read_c | direct 循环 5 条、conv 循环 10 条,Δins = 5 = VVA_CONV_INSN(逐指令对应;`-fno-tree-vectorize` 防止 direct 侧向量化破坏对称) |

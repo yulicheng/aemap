@@ -1,0 +1,9 @@
+# 构建产物(make clean 可再生)
+build/
+*.o
+
+# 测试运行产物(bench/run_all.sh 可再生)
+results/
+
+# Python
+__pycache__/
