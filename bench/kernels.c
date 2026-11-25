@@ -21,11 +21,11 @@ void (*volatile g_hop_hook)(void);
 
 static const kern_fn ktab_d[K_N] = {
     k_read_d, k_write_d, k_rmw_d, k_copy_blk_d, k_copy_word_d, k_copy_nt_d,
-    k_chase_d, k_daxpy_d, k_matmul_d
+    k_chase_d, k_daxpy_d, k_scale_d, k_add_d, k_matmul_d
 };
 static const kern_fn ktab_c[K_N] = {
     k_read_c, k_write_c, k_rmw_c, k_copy_blk_c, k_copy_word_c, k_copy_nt_c,
-    k_chase_c, k_daxpy_c, k_matmul_c
+    k_chase_c, k_daxpy_c, k_scale_c, k_add_c, k_matmul_c
 };
 
 kern_fn kern_get(enum kern_id id, int conv) {

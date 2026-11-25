@@ -130,7 +130,7 @@ static void KNAME(k_chase)(const uint64_t *addr, size_t n, uint64_t p1, uint64_t
     g_sink += p;
 }
 
-/* ---------------- daxpy(C14a):y[i] = a*x[i] + y[i],2 条流 ---------------- */
+/* ---------------- daxpy / STREAM Triad(C14a/C15):y[i] = a*x[i] + y[i],2 条流 ---------------- */
 static void KNAME(k_daxpy)(const uint64_t *addr, size_t n, uint64_t p1, uint64_t p2) {
     uint64_t xb = addr[0], yb = p1;
     double a;
@@ -139,6 +139,27 @@ static void KNAME(k_daxpy)(const uint64_t *addr, size_t n, uint64_t p1, uint64_t
     for (size_t i = 0; i < n; i++)
         *(double *)A2P(yb + 8 * i) += a * *(const double *)A2P(xb + 8 * i);
     g_sink += (uint64_t)(uintptr_t)yb;
+}
+
+/* ---------------- STREAM Scale(C15):a[i] = s * b[i],2 条流(1 读 + 1 写) ---------------- */
+static void KNAME(k_scale)(const uint64_t *addr, size_t n, uint64_t p1, uint64_t p2) {
+    uint64_t bb = addr[0], ab = p1;
+    double s;
+    memcpy(&s, &p2, sizeof(s));
+    KBASE(bb); KBASE(ab);
+    for (size_t i = 0; i < n; i++)
+        *(double *)A2P(ab + 8 * i) = s * *(const double *)A2P(bb + 8 * i);
+    g_sink += (uint64_t)(uintptr_t)ab;
+}
+
+/* ---------------- STREAM Add(C15):c[i] = a[i] + b[i],3 条流(2 读 + 1 写) ---------------- */
+static void KNAME(k_add)(const uint64_t *addr, size_t n, uint64_t p1, uint64_t p2) {
+    uint64_t ab = addr[0], bb = p1, cb = p2;
+    KBASE(ab); KBASE(bb); KBASE(cb);
+    for (size_t i = 0; i < n; i++)
+        *(double *)A2P(cb + 8 * i) = *(const double *)A2P(ab + 8 * i)
+                                   + *(const double *)A2P(bb + 8 * i);
+    g_sink += (uint64_t)(uintptr_t)cb;
 }
 
 /* ---------------- matmul 内层(C14b):C[i][j] += A[i][k]*B[k][j],3 条流 ---------------- */

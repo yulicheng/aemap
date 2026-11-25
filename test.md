@@ -52,13 +52,15 @@ cycles/op、ins/op、IPC、L1/L2/LLC miss per op、dTLB miss per op、带宽(GB/
 
 ```
 bench/
-├── main.c          # CLI:--case --k --enc --tag --base --reps --csv
+├── main.c          # CLI:--case --k --enc --tag --base --threads --reps --csv
 ├── harness.h/.c    # 计时封装、perf_event_open、rdpmc mmap、缓存/TLB 控制、统计
 ├── patterns.c      # seq/rand/stride/chase/zipf/gather 地址序列生成(xorshift 预生成)
 ├── kernels.c       # 内核 + 双实例实例化(§3.8)
-├── kernel_defs.h   # 内核定义(被实例化两次)
+├── kernel_defs.h   # 内核定义(被实例化两次;含 STREAM 四件套与多线程用例内核)
+├── mt.h/.c         # 多线程基础设施(§4.16/§4.17):worker 池、绑核、每线程
+│                   #   PMU 组(cycles+ins)、三 barrier 轮次编排、墙钟带宽
 ├── run_all.sh      # 环境设置 + 全用例扫描 + CSV 落盘
-└── analyze.py      # 汇总:Δ 曲线、变体排名、架构对比表
+└── analyze.py      # 汇总:Δ 曲线、变体排名、架构对比表、多线程扩展性
 ```
 
 ### 2.2 CLI 与一次运行
@@ -68,6 +70,8 @@ sudo sysctl kernel.perf_event_paranoid=1        # 允许用户态计数
 sudo cpupower frequency-set -g performance      # 锁频
 ./vva_bench --case c4 --k 4096 --enc B8 --tag strict --base pinned --reps 30 --csv out.csv
 taskset -c 2 ./vva_bench ...                    # 固定核(建议配合 isolcpus / 关 SMT 兄弟线程)
+./vva_bench --case c15 --threads 8 --sub triad  # 多线程:STREAM Triad 8 线程聚合带宽
+./vva_bench --case c16 --threads 8 --k 4096     # 多线程并发查表扩展性
 ```
 
 所有用例、所有变体、两架构由 `run_all.sh` 驱动,产出统一 CSV(§6)。
@@ -178,6 +182,8 @@ static void K_seq_read(const uint64_t *addr, size_t n, uint64_t *sink) {
 | C12 | TLB 交互 | C1/C4 复测 | 两档 | 大足迹 | 4KB vs 2MB 页 | Δdtlb/op | 补充 |
 | C13 | 变体矩阵 | 在 C2/C4 上跑全部变体 | 两档 | — | 变体 × 模式 | 变体排名表 | design.md §6 |
 | C14 | 多流计算内核 | daxpy / matmul 内层(2~3 条流 + 复用) | 热/混合 | 热 | 矩阵规模、块大小 | Δc/op、ALU 空隙隐藏率 | 补充(计算型 pattern) |
+| **C15** | 多线程并行访存 | STREAM 四件套 + 私有/共享/单行争用 | 每线程独立段(T 个) | 私有区 / 共享区 | 线程数 T、内核 | 聚合带宽(GB/s)、Δ/op(T) 扩展 | **必测(多核)** |
+| **C16** | 高并发表访问 | T 线程并发查表 | same/spread/hot 三档 | 恒热 4KB 页 | T × K | Δ/op(T) 扩展曲线、表 miss 聚合 | **必测(多核)** |
 
 ### 4.1 C0 差分正确性(性能测试前置 gate,不通过则中止)
 
@@ -267,6 +273,48 @@ C1/C4 在 4KB vs 2MB 页、表自身 4KB vs 2MB 映射下复测,记录 Δdtlb/op
 
 **预期**:转换指令主要被塞进 ALU/发射空隙 → **Δc/op 接近 0**;表项多但稳定常驻,无 miss 增量。该用例给出"计算密集场景转换几乎免费"的上界证据,与 C1/C8(访存受限)形成对照。验证方式同 §3.8 双实例,仅改变数据布局的 idx 分配。
 
+### 4.16 C15 多线程并行访存(STREAM 家族 + 争用,必测多核)
+
+N 个 pthread(`--threads`,默认 min(nproc,8)),worker 绑核(线程 0 = 主线程核,其余避开主线程核),**内核保持单线程逻辑**(§3.8 双实例不变),线程化在 harness 层:每线程独立地址列表/基址流,"私有数据区"由 `off_base` 按线程错开(4GB off 空间内),映射表多对一共享。
+
+每线程独立 perf 组(仅 cycles+ins,`pmu_open_pair`;N 线程 × 全事件会超计数器预算,
+且 HW_CACHE 双编码探测的惰性全局初始化非线程安全),线程内 reset/start → 三
+barrier(arm/go/done)→ 跑内核 → stop/read;主线程 `CLOCK_MONOTONIC` 测聚合墙钟出带宽。
+ABBA 仍成立:每 rep 全线程 direct 组 → 全线程 conv 组,奇偶 rep 交换先后。
+
+**内核 = STREAM 四件套**(`--sub`):triad(默认,复用 C14 daxpy)/ read / scale / add /
+copy(复用 C8 word)/ write;另有三种数据布局:
+
+| 布局 | 语义 | 观察 |
+|---|---|---|
+| 默认(私有区) | 每线程独立数据区(off_base 错开),纯聚合带宽 | 多核扩展比 BW(T)/BW(1);Δ/op(T) 应随 T 下降(转换指令被跨线程 MLP 隐藏) |
+| `shared` | 全线程同一数据区同一列表(RMW y 区) | LLC/内存真共享争用下的 Δ 放大 |
+| `contend` | 全线程写同一 64B cache line | 最坏伪共享/store 争用;direct 本身被压平,Δ 常反而小——给出"争用饱和时转换不再可见"的边界 |
+
+**指标**:聚合 Δc/op = Σ线程 Δ / 全线程 ops 合计;per-thread Δ/op 中位数;聚合带宽
+GB/s(流量按内核形状:triad 24B/元素、scale 16B、add 24B、copy 8B、read/write 4B)。
+CSV 的 direct_cyc/conv_cyc = Σ线程 cycles 的逐 rep 中位数;n_ops = 全线程合计。
+
+**注意**:pinned 构建下 worker 必须各自 `vva_tbl_pin()`(表基址寄存器是每线程属性);
+SEG(段缓存)变体为单线程假设(全局 s_idx/s_hi),C15/C16 入口显式拒绝。
+
+### 4.17 C16 高并发表访问(映射表多核扩展性,必测多核)
+
+多线程版 C4:T 线程并发随机查表,数据恒热(4KB 页,多对一),隔离"表侧"行为。
+三档模式(`--sub`):
+
+| 模式 | 表侧形态 | 预期 |
+|---|---|---|
+| `hot` | K=8,全线程同一热表(L1 行共享读) | 扩展性基线:Δ/op ≈ C2 下界,应随 T 平坦 |
+| `same`(默认) | 全线程全域 [0,K) 随机,miss 集合重叠 | 聚合 miss ≈ 单线程量级(互相"借"预取),Δ/op(T) 缓升 |
+| `spread` | 线程 t 用 idx ∈ [t·K,(t+1)·K),表足迹 ×T | miss 流量聚合 ×T,压内存控制器;Δ/op(T) 阶梯上升——"多核下表 miss 代价放大"的直接证据 |
+
+K 扫描同 C4(表足迹穿越 L1/L2/L3/DRAM),线程数扫描 T ∈ {1,2,4,8}。约束:idx 空间
+2^20,spread 需 T·K ≤ 2^20(入口校验)。
+
+**指标**:Δ/op(T) 扩展曲线、per-thread 中位、聚合带宽;与 C4 单线程阶梯对照,得出
+"多线程是否恶化转换的表 miss 代价"结论。
+
 ---
 
 ## 5. 输出与分析
@@ -302,6 +350,10 @@ arch,variant,enc,tag,base,isa,w,case,param,rep,
 | C4 K=1M / C5 全冷 | Δ ≈ +1 次表线访存延迟(120~250c 量级) |
 | C8 块级转换 | 热表 Δ% ≤ 5% |
 | C14 计算内核 | Δc/op 显著低于 C1(目标 ≤ 1 c/op) |
+| C15 私有区 T=1 | Δc/op ≈ C14 同内核单线程值(±20%,线程化零额外语义) |
+| C15 私有区 Δ/op(T) | 单调不增(跨线程 MLP 隐藏转换);聚合带宽随 T 上升至平台 |
+| C16 hot | Δ/op(T) 对 T 平坦(共享热行无争用) |
+| C16 spread K=1M 档 | Δ/op(T) ≥ 同足迹 C4 单线程值(多核 miss 聚合放大) |
 | 统计稳定性 | 90% 配置 MAD/median ≤ 5% |
 
 ---
@@ -317,6 +369,9 @@ arch,variant,enc,tag,base,isa,w,case,param,rep,
 - **预取器**:随机 pattern 下硬件预取基本无效;若需绝对纯净可用 MSR 关预取(可选,默认不关);
 - **TLB/页效应**:C4 必须区分表足迹与数据足迹(C12),否则阶梯曲线会混入 dTLB 分量;
 - **计数器权限**:perf_event_paranoid ≤ 1 或 root;
+- **多线程(pinned 寄存器)**:pinned 构建的表基址驻留寄存器(r15/x27)是每线程属性,C15/C16 的 worker 必须各自 `vva_tbl_pin()`(已实现);
+- **多线程(变体兼容性)**:SEG 段缓存变体为单线程假设(全局 s_idx/s_hi),C15/C16 入口显式拒绝;其余变体的 vva2va 为纯函数(只读表),多线程安全;
+- **多线程(计数器预算)**:每线程只开 cycles+ins 两组(`pmu_open_pair`),避免 N×6 事件超预算引发多路复用,也绕开 HW_CACHE 双编码探测的非线程安全惰性初始化;
 - **微架构覆盖**:同一架构至少测 2 代核(如 x86: Skylake 一代 + Zen/最新一代;ARM: A76 类 + V 系),C13 结论才具迁移性。
 
 ---
@@ -328,4 +383,5 @@ arch,variant,enc,tag,base,isa,w,case,param,rep,
 | M1 | harness(计时/PMU/状态控制)+ C0 | C0 全过;Δins 与 design.md §8.1 一致 |
 | M2 | C1/C2/C3/C4(默认变体) | 阶梯曲线三平台特征可辨;C2 达标 |
 | M3 | C5–C12、C14 全用例 | 验收表全 PASS 或记录偏差原因 |
+| M3b | C15/C16 多线程(STREAM 家族、争用、表并发扩展) | C15 T=1 ≈ C14;Δ/op(T) 扩展特征可辨;验收表全 PASS |
 | M4 | C13 变体矩阵 + analyze.py 报告 | 产出最终设计裁决(编码/tag/基址/扩展选项) |

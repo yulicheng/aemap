@@ -4,7 +4,8 @@
 # 流程:
 #   0. 环境检查与记录(架构 / 编译器 / perf 权限 / clflush / THP / CPU 型号)
 #   1. C0 差分正确性 gate(默认变体;失败即中止 —— §4.1 前置 gate)
-#   2. C1–C12、C14 全用例扫描(默认变体,含子模式与 C4 K 阶梯)→ results/scan_*.csv
+#   2. C1–C12、C14–C16 全用例扫描(默认变体,含子模式、C4 K 阶梯、
+#      C15 STREAM 家族 + 线程数扩展、C16 表访问并发扩展)→ results/scan_*.csv
 #   3. C13 变体矩阵:每个变体重跑 c0 + c13 别名(c2 + c4@{4K,64K,1M})
 #        default / fast / enc 互换 / mat / abs(x86) / pure / seg / clang / v3*
 #        * v3 需 CPU 支持 BMI1,否则仅编译并记录 N/A
@@ -93,7 +94,7 @@ fi
 
 # ================= 2. 全用例扫描(默认变体) =================
 log ""
-log "== 2. C1–C12、C14 全用例扫描(reps=$REPS)=="
+log "== 2. C1–C12、C14–C16 全用例扫描(reps=$REPS)=="
 SCAN="$RES/scan_${ARCH}_$TS.csv"
 run_cases() {  # $1 = --sub 参数(空串表示无),$2 = case 列表
     local sub="$1" cases="$2"
@@ -125,6 +126,38 @@ run_cases ""    "c12"           || RC_ALL=1
 run_cases "2m"  "c12"           || RC_ALL=1
 run_cases ""    "c14"           || RC_ALL=1
 run_cases "matmul" "c14"        || RC_ALL=1
+
+# C15 多线程并行访存(STREAM 家族 + 争用,test.md §4.16):默认线程数 = min(nproc,8)
+log "-- C15 多线程并行访存扫描 --"
+for sub in triad read scale add copy write shared contend; do
+    run_cases "$sub" "c15" || RC_ALL=1
+done
+# 线程数扩展性(triad:T = 1,2,4,8 与可用核数取交)
+NCPU=$(nproc 2>/dev/null || echo 1)
+for T in 1 2 4 8; do
+    [ "$T" -gt "$NCPU" ] && continue
+    ./build/vva_bench --case c15 --sub triad --threads "$T" \
+        --reps "$REPS" --csv "$SCAN" >>"$LOG" 2>&1 || RC_ALL=1
+done
+
+# C16 高并发表访问(test.md §4.17):same/spread/hot + K 阶梯
+log "-- C16 高并发表访问扫描 --"
+run_cases "hot"  "c16"          || RC_ALL=1
+for K in 4096 65536 1048576; do
+    ./build/vva_bench --case c16 --sub same --k "$K" --reps "$REPS" --csv "$SCAN" >>"$LOG" 2>&1 || RC_ALL=1
+    # spread 表足迹 ×T(T=8),须满足 T·K ≤ 2^20(VVA_MAP_SIZE);超限属设计内跳过,非失败
+    if [ "$((K * 8))" -le 1048576 ]; then
+        ./build/vva_bench --case c16 --sub spread --k "$K" --reps "$REPS" --csv "$SCAN" >>"$LOG" 2>&1 || RC_ALL=1
+    else
+        log "   C16 spread k=$K 跳过:T·K=$((K * 8)) > 2^20 表容量上限(设计内)"
+    fi
+done
+# 线程数扩展性(same@4K)
+for T in 1 2 4 8; do
+    [ "$T" -gt "$NCPU" ] && continue
+    ./build/vva_bench --case c16 --sub same --threads "$T" \
+        --reps "$REPS" --csv "$SCAN" >>"$LOG" 2>&1 || RC_ALL=1
+done
 
 # C4 K 阶梯(test.md §4.5 全扫描:64B→8MB 穿越 L1/L2/L3/DRAM)
 log "-- C4 K 阶梯扫描 --"

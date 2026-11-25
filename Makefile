@@ -176,10 +176,11 @@ CPPFLAGS += -DVVA_BUILD_ARCH='"$(ARCH)"' -DVVA_BUILD_ENC='"$(ENC)"' \
             -DVVA_BUILD_VARIANT='"$(VARIANT)"'
 
 # ---- 目标 ----
-SRCS := main.c harness.c patterns.c kernels.c
+SRCS := main.c harness.c patterns.c kernels.c mt.c
 OBJS := $(addprefix $(OBJDIR)/,$(SRCS:.c=.o)) $(OBJDIR)/vva_map.o
 HDRS := include/vva.h include/vva_common.h arch/$(ARCH)/vva_impl.h \
-        bench/harness.h bench/patterns.h bench/kernels.h bench/kernel_defs.h
+        bench/harness.h bench/patterns.h bench/kernels.h bench/kernel_defs.h \
+        bench/mt.h
 OBJDUMP ?= objdump
 
 .PHONY: all check codegen clean
@@ -194,7 +195,7 @@ $(OBJDIR)/%.o: %.c $(HDRS) Makefile | $(OBJDIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BIN): $(OBJS) | $(dir $(BIN))
-	$(CC) $(CFLAGS) $(OBJS) -o $@ $(LDFLAGS) -lm
+	$(CC) $(CFLAGS) $(OBJS) -o $@ $(LDFLAGS) -lm -lpthread
 
 check: $(BIN)
 	./$(BIN) --case c0

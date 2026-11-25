@@ -145,6 +145,25 @@ void pmu_close(struct pmuset *s) {
     s->n = 0; s->ok = 0;
 }
 
+void pmu_open_pair(struct pmuset *s) {
+    memset(s, 0, sizeof(*s));
+    for (int i = 0; i < PMU_NMET; i++) s->fd[i] = -1;
+    struct perf_event_attr a;
+    attr_init(&a, PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES);
+    int fd = (int)sys_perf_event_open(&a, 0, -1, -1, 0);
+    if (fd < 0) return;                       /* perf 不可用:ok=0,调用方退化 */
+    s->fd[PMU_CYC] = fd;
+    ioctl(fd, PERF_EVENT_IOC_ID, &s->id[PMU_CYC]);
+    attr_init(&a, PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS);
+    fd = (int)sys_perf_event_open(&a, 0, -1, s->fd[PMU_CYC], 0);
+    if (fd >= 0) {
+        s->fd[PMU_INS] = fd;
+        ioctl(fd, PERF_EVENT_IOC_ID, &s->id[PMU_INS]);
+    }
+    s->n = (s->fd[PMU_INS] >= 0) ? 2 : 1;
+    s->ok = 1;
+}
+
 static void group_ioctl(struct pmuset *s, int cmd, unsigned long arg) {
     for (int i = 0; i < PMU_NMET; i++)
         if (s->fd[i] >= 0) ioctl(s->fd[i], cmd, arg);

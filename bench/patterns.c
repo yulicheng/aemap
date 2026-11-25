@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <assert.h>
 
 #define IDX_BASE 1u   /* 段 idx 默认值;映射为 H = 数据段高 32 位(见 main.c) */
 
@@ -20,6 +21,15 @@ static uint64_t rnd(struct pat_ctx *c) { return xs64(&c->seed); }
 /* off 对齐到 4 字节(u32 访存);chase/浮点用 8 字节 */
 static uint64_t align4(uint64_t v) { return v & ~(uint64_t)3; }
 static uint64_t align8(uint64_t v) { return v & ~(uint64_t)7; }
+
+/* C15/C16 多线程布局构造:idx_base(线程独立 idx 段)与 off_base(线程独立
+ * 数据区)叠加。越界即 abort —— 静默截断会让两个线程的区间重叠,公平性
+ * 与"私有数据区"语义双双失效(idx 空间 2^20,off 空间 2^32)。 */
+static uint64_t vmake(const struct pat_ctx *c, uint64_t idx, uint64_t off) {
+    assert(idx + c->idx_base < (1ULL << 20) || !"idx 超出 2^20 空间");
+    assert(off + c->off_base <= 0xFFFFFFFFULL || !"off 超出 4GB 数据段");
+    return VVA_MAKE((uint32_t)(c->idx_base + idx), (uint32_t)(off + c->off_base));
+}
 
 void derive_direct(struct pat_ctx *c) {
     /* direct 列表由同一映射函数预计算(§3.5),保证两模式访问相同 cache line */
@@ -39,8 +49,8 @@ void chain_free(struct pat_ctx *c) {
 void gen_seq(struct pat_ctx *c, uint64_t bytes) {
     c->n = bytes / 4;
     for (size_t i = 0; i < c->n; i++)
-        c->conv[i] = VVA_MAKE(IDX_BASE, 4 * i);
-    c->data_size = bytes;
+        c->conv[i] = vmake(c, IDX_BASE, 4 * i);
+    c->data_size = c->off_base + bytes;
 }
 
 /* ---------------- C2 相近 VVA 热点 ---------------- */
@@ -48,24 +58,25 @@ void gen_hot(struct pat_ctx *c, size_t n, uint32_t window) {
     size_t words = window / 4;
     if (!words) words = 1;
     for (size_t i = 0; i < n; i++)
-        c->conv[i] = VVA_MAKE(IDX_BASE, (uint32_t)(4 * (i % words)));
+        c->conv[i] = vmake(c, IDX_BASE, (uint32_t)(4 * (i % words)));
     c->n = n;
-    c->data_size = window < 4096 ? 4096 : window;
+    c->data_size = c->off_base + (window < 4096 ? 4096 : window);
 }
 
 /* ---------------- C3/C11/C12 段内随机 off ---------------- */
 void gen_randoff(struct pat_ctx *c, size_t n, uint64_t span) {
     if (!span) span = 4096;
     for (size_t i = 0; i < n; i++)
-        c->conv[i] = VVA_MAKE(IDX_BASE, (uint32_t)align4(rnd(c) % span));
+        c->conv[i] = vmake(c, IDX_BASE, align4(rnd(c) % span));
     c->n = n;
-    c->data_size = span < 4096 ? 4096 : span;
+    c->data_size = c->off_base + (span < 4096 ? 4096 : span);
 }
 
 /* ---------------- C4 随机索引 ---------------- */
 void gen_randidx(struct pat_ctx *c, size_t n) {
     /* 默认多对一:idx 随机、off 固定在首 4KB 数据页 → 数据足迹恒定,
-     * 表足迹 = K 项(§3.5);C4b(independent):每个 idx 一页,数据足迹 = K 页 */
+     * 表足迹 = K 项(§3.5);C4b(independent):每个 idx 一页,数据足迹 = K 页。
+     * C16 spread 借 idx_base 把线程 t 的 idx 段错开到 [t*K, (t+1)*K)。 */
     uint32_t K = c->K ? c->K : 1;
     for (size_t i = 0; i < n; i++) {
         uint32_t idx = (uint32_t)(rnd(c) % K);
@@ -74,10 +85,10 @@ void gen_randidx(struct pat_ctx *c, size_t n) {
             off = 4096ULL * idx + (rnd(c) & 0xFF8);      /* ≤ 4096*K < 2^32(K≤1M) */
         else
             off = rnd(c) & 0xFF8;
-        c->conv[i] = VVA_MAKE(idx, (uint32_t)off);
+        c->conv[i] = vmake(c, idx, off);
     }
     c->n = n;
-    c->data_size = c->independent ? 4096ULL * K : 4096;
+    c->data_size = c->independent ? 4096ULL * K : c->off_base + 4096;
 }
 
 /* ---------------- C7 跨段步长 ---------------- */
@@ -131,14 +142,15 @@ void gen_gather(struct pat_ctx *c, size_t n) {
 /* ---------------- C8 拷贝 ---------------- */
 void gen_copy(struct pat_ctx *c, uint64_t bytes, int word_mode) {
     /* 布局契约(main.c 依赖):源列表 conv[0..n),目的列表自 conv[n+1] 起,
-     * cap = 2n+2;derive_direct 按 n 填 direct 双流。 */
+     * cap = 2n+2;derive_direct 按 n 填 direct 双流。
+     * off_base 错开后每线程源区 [ob, ob+bytes)、目的区 [ob+bytes, ob+2bytes)。 */
     if (word_mode) {
         c->n = bytes / 4;
         c->block_words = 1;
         c->dst_conv = &c->conv[c->n + 1];
         for (size_t i = 0; i < c->n; i++) {
-            c->conv[i]     = VVA_MAKE(IDX_BASE, (uint32_t)(4 * i));
-            c->dst_conv[i] = VVA_MAKE(IDX_BASE, (uint32_t)(bytes + 4 * i));
+            c->conv[i]     = vmake(c, IDX_BASE, (uint32_t)(4 * i));
+            c->dst_conv[i] = vmake(c, IDX_BASE, (uint32_t)(bytes + 4 * i));
         }
     } else {
         uint32_t bw = c->block_words ? c->block_words : 16;   /* 64B/块 */
@@ -146,11 +158,11 @@ void gen_copy(struct pat_ctx *c, uint64_t bytes, int word_mode) {
         c->n = bytes / bb;
         c->dst_conv = &c->conv[c->n + 1];
         for (size_t b = 0; b < c->n; b++) {
-            c->conv[b]     = VVA_MAKE(IDX_BASE, (uint32_t)(b * bb));
-            c->dst_conv[b] = VVA_MAKE(IDX_BASE, (uint32_t)(bytes + b * bb));
+            c->conv[b]     = vmake(c, IDX_BASE, b * bb);
+            c->dst_conv[b] = vmake(c, IDX_BASE, bytes + b * bb);
         }
     }
-    c->data_size = 2 * bytes;
+    c->data_size = c->off_base + 2 * bytes;
 }
 
 /* ---------------- C6 指针追逐 ---------------- */
@@ -185,17 +197,34 @@ void fill_chain(struct pat_ctx *c, int conv_mode) {
 /* ---------------- C14a daxpy ---------------- */
 void gen_daxpy(struct pat_ctx *c, size_t n) {
     c->n = n;
-    c->extra_x = VVA_MAKE(IDX_BASE, 0);              /* x = [0, 8n) */
-    c->extra_y = VVA_MAKE(IDX_BASE, align8(8 * n));  /* y = [8n, 16n) */
-    c->data_size = 16 * n;
+    c->extra_x = vmake(c, IDX_BASE, 0);              /* x = [ob, ob+8n) */
+    c->extra_y = vmake(c, IDX_BASE, align8(8 * n));  /* y = [ob+8n, ob+16n) */
+    c->data_size = c->off_base + 16 * n;
 }
 
 /* ---------------- C14b matmul ---------------- */
 void gen_matmul(struct pat_ctx *c, uint32_t N) {
     c->n = N;
     uint64_t a = 8ULL * N * N;
-    c->extra_x = VVA_MAKE(IDX_BASE, 0);              /* A */
-    c->extra_y = VVA_MAKE(IDX_BASE, (uint32_t)a);    /* B(8N² 后) */
-    c->extra_z = VVA_MAKE(IDX_BASE, (uint32_t)(2 * a)); /* C(16N² 后) */
+    c->extra_x = vmake(c, IDX_BASE, 0);              /* A */
+    c->extra_y = vmake(c, IDX_BASE, (uint32_t)a);    /* B(8N² 后) */
+    c->extra_z = vmake(c, IDX_BASE, (uint32_t)(2 * a)); /* C(16N² 后) */
     c->data_size = 3 * a + 64;
+}
+
+/* ---------------- C15 STREAM Scale:a[i] = s*b[i],双流基址 ---------------- */
+void gen_scale(struct pat_ctx *c, size_t n) {
+    c->n = n;
+    c->extra_x = vmake(c, IDX_BASE, 0);              /* b(读) = [ob, ob+8n) */
+    c->extra_y = vmake(c, IDX_BASE, align8(8 * n));  /* a(写) = [ob+8n, ob+16n) */
+    c->data_size = c->off_base + 16 * n;
+}
+
+/* ---------------- C15 STREAM Add:c[i] = a[i]+b[i],三流基址 ---------------- */
+void gen_add(struct pat_ctx *c, size_t n) {
+    c->n = n;
+    c->extra_x = vmake(c, IDX_BASE, 0);              /* a = [ob, ob+8n) */
+    c->extra_y = vmake(c, IDX_BASE, align8(8 * n));  /* b = [ob+8n, ob+16n) */
+    c->extra_z = vmake(c, IDX_BASE, align8(16 * n)); /* c = [ob+16n, ob+24n) */
+    c->data_size = c->off_base + 24 * n;
 }

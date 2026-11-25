@@ -29,6 +29,8 @@ struct pat_ctx {
     uint32_t   stride;                  /* C7 idx 步长 */
     uint32_t   block_words;             /* C8 块内字数 */
     int        independent;             /* C4b:idx→独立数据页(数据足迹随 K) */
+    uint64_t   idx_base;                /* C16 spread:idx 偏移(线程 t 用 [t*K,(t+1)*K)) */
+    uint64_t   off_base;                /* C15:off 偏移(每线程独立数据区,字节) */
 
     /* C6 链表 */
     size_t    *chain_pos;               /* 节点访问次序(供 fill_chain 重填) */
@@ -49,6 +51,8 @@ void gen_copy(struct pat_ctx *c, uint64_t bytes, int word_mode);/* C8:块级/字
 void gen_chase(struct pat_ctx *c, size_t hops);                 /* C6:链表节点次序 */
 void gen_daxpy(struct pat_ctx *c, size_t n);                    /* C14a:双流基址 */
 void gen_matmul(struct pat_ctx *c, uint32_t N);                 /* C14b:三流基址 */
+void gen_scale(struct pat_ctx *c, size_t n);                    /* C15:STREAM Scale 双流基址 */
+void gen_add(struct pat_ctx *c, size_t n);                      /* C15:STREAM Add 三流基址 */
 
 void derive_direct(struct pat_ctx *c);   /* direct[i] = vva2va_pure(conv[i])(映射完成后) */
 void fill_chain(struct pat_ctx *c, int conv_mode);  /* 链值按模式重填(VVA 或 VA) */

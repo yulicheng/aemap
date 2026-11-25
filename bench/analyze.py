@@ -7,6 +7,7 @@
 #   3. C13 变体排名表(热 = c2 / 冷 = c4@K=1M 两栏,按编译器分栏)
 #   4. 架构对比表(同用例 Δ、IPC、每访存 miss 差异;两架构数据齐备时)
 #   5. 噪声报告(MAD/|Δ| > 5% 的配置清单 + rdtsc 回退清单)
+#   6. 多线程扩展性(C15 并行访存 / C16 高并发表访问的 Δ-op(T) 曲线)
 #
 # 用法:
 #   python3 bench/analyze.py scan_xxx.csv [c13_xxx.csv ...] [--status c13_status.txt]
@@ -305,6 +306,51 @@ def noise(rows):
         table(["variant", "param", "direct", "conv", "Δ%"], t)
 
 
+# ================= 6. 多线程扩展性(C15/C16) =================
+def thread_scaling(rows):
+    hdr("6. 多线程扩展性(C15 并行访存 / C16 高并发表访问;test.md §4.16/§4.17)")
+    mt = [r for r in rows if r.case in ("c15", "c16")]
+    if not mt:
+        print("(无 C15/C16 数据)")
+        return
+    for r in mt:
+        r.T = 0
+        for tok in (r.param or "").split(","):
+            if tok.startswith("t="):
+                try:
+                    r.T = int(tok[2:])
+                except ValueError:
+                    pass
+    by_arch = defaultdict(list)
+    for r in mt:
+        by_arch[r.arch].append(r)
+    for arch, rs in sorted(by_arch.items()):
+        print(f"\n--- {arch} ---")
+        # 扩展性:同 (case, kern/mode, n) 按 T 排序,Δ/op 随 T 的变化
+        groups = defaultdict(list)
+        for r in rs:
+            key = [r.case]
+            for tok in (r.param or "").split(","):
+                if tok.startswith(("kern=", "k=")) or tok.startswith("mode="):
+                    key.append(tok)
+                if tok.startswith("n="):
+                    key.append(tok)
+            groups[tuple(key)].append(r)
+        t = []
+        for key, rs2 in sorted(groups.items()):
+            rs2.sort(key=lambda r: r.T)
+            t.append([" ".join(key),
+                      "→".join(str(r.T) for r in rs2),
+                      "→".join(f"{r.dop:+.2f}" for r in rs2),
+                      "→".join(f"{r.direct_cyc / max(r.n_ops, 1):.2f}"
+                               for r in rs2),
+                      "→".join(f"{r.conv_cyc / max(r.n_ops, 1):.2f}"
+                               for r in rs2)])
+        table(["配置", "T 扫描", "Δc/op", "direct c/op", "conv c/op"], t)
+        print("  预期:Δ/op 随 T 下降(转换指令被多线程 MLP 隐藏,§4.16);"
+              "C16 表足迹 ×T 后 Δ 阶梯上升(§4.17)")
+
+
 def main():
     argv = sys.argv[1:]
     status_path = None
@@ -333,6 +379,7 @@ def main():
     ranking(rows)
     arch_cmp(rows)
     noise(rows)
+    thread_scaling(rows)
 
 
 if __name__ == "__main__":

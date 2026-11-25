@@ -26,6 +26,7 @@
 #include "harness.h"
 #include "patterns.h"
 #include "kernels.h"
+#include "mt.h"
 
 /* ---------------- 构建身份(Makefile 注入;手工编译时给出合理回退) ---------------- */
 #ifndef VVA_BUILD_ARCH
@@ -90,7 +91,7 @@ extern void (*volatile g_hop_hook)(void);
 /* ============================ 选项 ============================ */
 
 struct opts {
-    const char *cases;      /* 逗号分隔:c0..c14 */
+    const char *cases;      /* 逗号分隔:c0..c16 */
     long   k, nops, reps, bytes, window, span, stride, win_bytes, block, mb;
     const char *sub;        /* 用例子模式 */
     long   seed;
@@ -100,6 +101,7 @@ struct opts {
     const char *csv;
     const char *arch, *enc, *tag, *base, *isa, *variant;
     int    force, no_ins_check, table_hp, list_only;
+    long   threads;         /* C15/C16:并行线程数(0 = 默认 min(nproc,8)) */
 };
 
 static struct opts O = {
@@ -111,7 +113,7 @@ static struct opts O = {
 #else
     .raw_l2m = -1,            /* Intel raw umask 因微架构而异,--raw-l2m 显式开启 */
 #endif
-    .sub = "", .variant = VVA_BUILD_VARIANT,
+    .sub = "", .variant = VVA_BUILD_VARIANT, .threads = 0,
 };
 
 /* ============================ 运行上下文 ============================ */
@@ -357,6 +359,142 @@ static int run_and_report(struct runctx *rc, const char *case_id, struct opts *o
     return (ins_ok == 0) ? 2 : 0;
 }
 
+/* ============================ 多线程计量(C15/C16) ============================
+ * 与 run_and_report 同构,但执行单元 = 线程组(mt_round):
+ *  - 每 rep ABBA 交错(偶 rep 先 direct 组后 conv 组,奇 rep 反之),成对做差;
+ *  - Δ = Σ线程 conv − Σ线程 direct;Δ/op 分母 = 全部线程 ops 合计;
+ *  - 带宽 = 每轮内存流量 / 聚合墙钟中位数(GB/s);
+ *  - 任一线程无 PMU(qemu/权限)时 cyc 缺贡献 → 自动退化为墙钟差并标注。
+ */
+
+struct mt_report_in {
+    struct mt_job *jd, *jc;   /* 各 [T]:direct / conv 线程任务 */
+    int T;
+    size_t n_ops;             /* 归一化分母(全部线程 ops 合计) */
+    double bytes_round;       /* 每轮内存流量字节(带宽计算) */
+    long   pt_ops;            /* 每线程 ops(per-thread 视图分母) */
+    const char *case_id, *param;
+};
+
+static int mt_run_and_report(const struct mt_report_in *ri, struct opts *o,
+                             struct pmuset *pmu, FILE *csvf) {
+    long reps = o->reps;
+    int T = ri->T;
+    struct mt_stats *ds = calloc((size_t)reps, sizeof(*ds));
+    struct mt_stats *cs = calloc((size_t)reps, sizeof(*cs));
+    double *diff = malloc((size_t)reps * sizeof(double));
+    double *dthr = malloc((size_t)reps * (size_t)T * sizeof(double));
+    double *cs_thr = malloc((size_t)reps * (size_t)T * sizeof(double));
+    double *ds_thr = malloc((size_t)reps * (size_t)T * sizeof(double));
+    int *ok_st = malloc((size_t)T * sizeof(int));
+    if (!ds || !cs || !diff || !dthr || !cs_thr || !ds_thr || !ok_st) {
+        fprintf(stderr, "oom\n"); exit(1);
+    }
+    (void)pmu;                /* MT 用每线程独立 perf 组,主线程组仅指示权限 */
+
+    /* 2 次预热(§3.6):两模式各一次;顺便捕获每线程 PMU 可用性(worker 内
+     * perf 组开一次固定不变) */
+    for (int w = 0; w < 2; w++) mt_round(w ? ri->jc : ri->jd, T, w ? &cs[0] : &ds[0]);
+    for (int t = 0; t < T; t++) ok_st[t] = cs[0].ok_thr[t] && ds[0].ok_thr[t];
+    g_sink = 0;
+
+    /* ABBA 交错(§3.6):偶 rep 先 direct 后 conv,奇 rep 反之。
+     * per-thread 视图须在每轮后立即拷贝:mt_stats.cyc_thr 指向 mt.c 内部
+     * 数组,下一次 mt_round 会覆盖;两轮数据按模式对齐后做差。 */
+    int pmu_all = 1;
+    for (long r = 0; r < reps; r++) {
+        int first_conv = (int)(r & 1);
+        mt_round(first_conv ? ri->jc : ri->jd, T, first_conv ? &cs[r] : &ds[r]);
+        memcpy(&cs_thr[(size_t)r * T], (first_conv ? &cs[r] : &ds[r])->cyc_thr,
+               (size_t)T * sizeof(double));            /* r1 = 第 1 轮 */
+        mt_round(first_conv ? ri->jd : ri->jc, T, first_conv ? &ds[r] : &cs[r]);
+        memcpy(&ds_thr[(size_t)r * T], (first_conv ? &ds[r] : &cs[r])->cyc_thr,
+               (size_t)T * sizeof(double));            /* r2 = 第 2 轮 */
+        if (cs[r].cyc_ok_n != T || ds[r].cyc_ok_n != T) pmu_all = 0;
+        for (int t = 0; t < T; t++) {
+            double r1 = cs_thr[(size_t)r * T + t], r2 = ds_thr[(size_t)r * T + t];
+            /* conv − direct:先 conv 时 = r1−r2;先 direct 时 = r2−r1 */
+            dthr[(size_t)r * T + t] = first_conv ? r1 - r2 : r2 - r1;
+        }
+        diff[r] = cs[r].cyc_sum - ds[r].cyc_sum;
+    }
+
+    /* 无 PMU 线程:cyc 缺贡献 → 以墙钟差(ms)代 cycles 差,仅作趋势 */
+    if (!pmu_all) {
+        for (long r = 0; r < reps; r++)
+            diff[r] = cs[r].wall_ms - ds[r].wall_ms;
+    }
+
+    double med  = median_of(diff, reps);
+    double mad  = mad_of(diff, reps, med);
+    double d_op = ri->n_ops ? med / (double)ri->n_ops : 0.0;
+    double mad_ratio = med != 0 ? mad / (med > 0 ? med : -med) * 100.0 : 0;
+
+    /* per-thread Δ/op:全部 (rep,线程) 对的中位数(仅 PMU 可用线程) */
+    double pt_med = 0;
+    {
+        double *v = malloc((size_t)reps * (size_t)T * sizeof(double));
+        size_t m = 0;
+        for (long r = 0; r < reps; r++)
+            for (int t = 0; t < T; t++)
+                if (ok_st[t] && ri->pt_ops > 0)
+                    v[m++] = dthr[(size_t)r * T + t] / (double)ri->pt_ops;
+        if (m) pt_med = median_of(v, m);
+        free(v);
+    }
+
+    /* 带宽:单模式墙钟中位数(取 direct 侧最小噪声) */
+    double *wd = malloc((size_t)reps * sizeof(double));
+    for (long r = 0; r < reps; r++) wd[r] = ds[r].wall_ms;
+    double bw = 0;
+    double wall_med = median_of(wd, reps);
+    if (wall_med > 0 && ri->bytes_round > 0)
+        bw = ri->bytes_round / wall_med / 1e6;    /* B / (ms×1e6) → GB/s */
+    free(wd);
+
+    printf("[%s] %s reps=%ld T=%d n_ops=%zu%s\n", ri->case_id, ri->param, reps, T,
+           ri->n_ops, pmu_all ? "" : "  (墙钟回退:部分线程无 PMU)");
+    printf("  Δc%s/op = %+8.2f ± %.2f   per-thread 中位 %+8.2f   (mad/med %4.1f%%)%s\n",
+           pmu_all ? "yc" : "wall(ms)", d_op,
+           ri->n_ops ? mad / (double)ri->n_ops : 0.0, pt_med, mad_ratio,
+           mad_ratio > 5.0 ? "  ⚠ 不稳定" : "");
+    if (bw > 0)
+        printf("  聚合带宽: %.1f GB/s(墙钟,流量 %.1f MB/轮)\n",
+               bw, ri->bytes_round / 1e6);
+
+    /* CSV(test.md §5.1):cyc 列 = Σ线程 cycles 中位数;miss 类不计量,置 0 */
+    double d_cyc, c_cyc, d_ins, c_ins;
+    {
+        double *a = malloc((size_t)reps * sizeof(double));
+        for (long r = 0; r < reps; r++) a[r] = ds[r].cyc_sum;
+        d_cyc = median_of(a, reps);
+        for (long r = 0; r < reps; r++) a[r] = cs[r].cyc_sum;
+        c_cyc = median_of(a, reps);
+        for (long r = 0; r < reps; r++) a[r] = ds[r].ins_sum;
+        d_ins = median_of(a, reps);
+        for (long r = 0; r < reps; r++) a[r] = cs[r].ins_sum;
+        c_ins = median_of(a, reps);
+        free(a);
+    }
+    if (csvf) {
+        fprintf(csvf,
+                "%s,%s,%s,%s,%s,%s,%d,\"%s\",\"%s\",%ld,"
+                "%.1f,%.1f,%zu,%.1f,%.1f,"
+                "%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,"
+                "%.1f,%.1f,%.1f,%d,%.3f,%ld,%d\n",
+                VVA_BUILD_ARCH, o->variant, VVA_BUILD_ENC, VVA_BUILD_TAG, VVA_BUILD_BASE,
+                VVA_BUILD_ISA, VVA_BUILD_W, ri->case_id, ri->param, reps,
+                d_cyc, c_cyc, ri->n_ops, d_ins, c_ins,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, cpu_freq_mhz(), pmu_all, mad / (double)(ri->n_ops ? ri->n_ops : 1),
+                0L, -1);
+        fflush(csvf);
+    }
+
+    free(ds); free(cs); free(diff); free(dthr); free(cs_thr); free(ds_thr); free(ok_st);
+    return 0;
+}
+
 /* ============================ C0 差分正确性(§4.1) ============================ */
 
 static int c0_fail(const char *what) {
@@ -491,6 +629,10 @@ static int case_run(const char *id, struct opts *o, struct pmuset *pmu, FILE *cs
     p->seed = (uint64_t)O.seed ^ (uint64_t)(uintptr_t)id;
     rc.is_loop_read = 1;
     char param[96]; rc.param = param;
+
+    /* c15/c16 专用路径的解析结果(见下方 mt 块) */
+    int mt_case = 0, mt_shared = 0, mt_contend = 0, mt_spread = 0, mt_hotk = 0;
+    enum kern_id mt_kern = K_READ;
 
     size_t n = o->nops > 0 ? (size_t)o->nops : 0;
     uint64_t bytes = 0, span_v = 0;
@@ -627,6 +769,32 @@ static int case_run(const char *id, struct opts *o, struct pmuset *pmu, FILE *cs
             rc.n_ops = 2 * dn;
             snprintf(param, sizeof(param), "n=%zu,daxpy", dn);
         }
+    } else if (!strcmp(id, "c15")) {               /* 多线程并行访存(STREAM 家族,§4.16) */
+        mt_case = 15;
+        const char *sb = o->sub && *o->sub ? o->sub : "triad";
+        if      (!strcmp(sb, "triad"))   mt_kern = K_DAXPY;     /* STREAM Triad */
+        else if (!strcmp(sb, "read"))    mt_kern = K_READ;      /* STREAM Read */
+        else if (!strcmp(sb, "scale"))   mt_kern = K_SCALE;     /* STREAM Scale */
+        else if (!strcmp(sb, "add"))     mt_kern = K_ADD;       /* STREAM Add */
+        else if (!strcmp(sb, "copy"))    mt_kern = K_COPY_WORD; /* STREAM Copy */
+        else if (!strcmp(sb, "write"))   mt_kern = K_WRITE;
+        else if (!strcmp(sb, "shared"))  { mt_kern = K_DAXPY; mt_shared = 1; }
+        else if (!strcmp(sb, "contend")) { mt_kern = K_WRITE; mt_contend = 1; }
+        else {
+            fprintf(stderr, "c15 未知子模式 %s"
+                    "(triad/read/scale/add/copy/write/shared/contend)\n", sb);
+            return 1;
+        }
+    } else if (!strcmp(id, "c16")) {               /* 高并发表访问(§4.17) */
+        mt_case = 16;
+        const char *sb = o->sub && *o->sub ? o->sub : "same";
+        if      (!strcmp(sb, "same"))   mt_spread = 0;   /* 全域随机,miss 集合重叠 */
+        else if (!strcmp(sb, "spread")) mt_spread = 1;   /* 线程独立 idx 段,足迹 ×T */
+        else if (!strcmp(sb, "hot"))    mt_hotk = 1;     /* 共享热表,扩展性基线 */
+        else {
+            fprintf(stderr, "c16 未知子模式 %s(same/spread/hot)\n", sb);
+            return 1;
+        }
     } else {
         fprintf(stderr, "未知用例 %s\n", id);
         return 1;
@@ -673,6 +841,232 @@ static int case_run(const char *id, struct opts *o, struct pmuset *pmu, FILE *cs
         free(rc.pat.conv); free(rc.pat.direct);
         munmap(base, p->data_size);
         return r;
+    }
+
+    /* ---- c15/c16 专用路径:线程组执行(mt_round,§4.16/§4.17) ----
+     * 内核保持单线程逻辑,线程化只在本层:每线程独立地址列表/基址流,
+     * "每线程私有数据区"由 off_base 错开,映射表共享(多对一)。
+     * SEG(段缓存)变体为单线程假设(全局 s_idx/s_hi),显式拒绝。 */
+    if (mt_case) {
+#if defined(VVA_SEG_CACHE)
+        (void)mt_case;
+        fprintf(stderr, "c15/c16 与 SEG(段缓存)变体不兼容:"
+                        "全局段缓存是单线程假设,多线程将产生数据竞争\n");
+        return 1;
+#else
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu < 1) ncpu = 1;
+        int T = o->threads > 0 ? (int)o->threads : (int)(ncpu > 8 ? 8 : ncpu);
+        if (T < 1 || T > MT_MAX_THREADS) {
+            fprintf(stderr, "--threads 范围 1..%d\n", MT_MAX_THREADS);
+            return 1;
+        }
+        int is_c15 = (mt_case == 15);
+        int dbl = is_c15 && (mt_kern == K_DAXPY || mt_kern == K_SCALE || mt_kern == K_ADD);
+        int is_copy = is_c15 && mt_kern == K_COPY_WORD;
+        int is_write_seq = is_c15 && mt_kern == K_WRITE && !mt_contend;
+
+        /* 每线程迭代数:C15 浮点内核 4M 元素 / u32 内核 16M 字(64MB);
+         * C16 随 K 缩放(与 C4 同规则) */
+        size_t n_per;
+        if (is_c15)
+            n_per = o->nops > 0 ? (size_t)o->nops : (dbl ? (1u << 22) : (1u << 24));
+        else {
+            uint32_t K16 = o->k > 0 ? (uint32_t)o->k : (mt_hotk ? 8 : 4096);
+            n_per = o->nops > 0 ? (size_t)o->nops
+                  : (K16 <= 4096 ? (2u << 20) : K16 <= 65536 ? (1u << 20) : (500u << 10));
+        }
+
+        /* C16 参数与表容量(idx 空间 2^20;gen_randidx 用本地 idx ∈ [0,K),
+         * spread 叠加 idx_base = t*K → 共需 T*K 项) */
+        uint32_t K16 = o->k > 0 ? (uint32_t)o->k : 4096;
+        uint32_t Kc = 2;
+        if (!is_c15) {
+            if (mt_hotk) K16 = 8;
+            Kc = mt_spread ? (uint32_t)T * K16 : K16;
+            if ((uint64_t)Kc > VVA_MAP_SIZE) {
+                fprintf(stderr, "c16 %s 需要 %u 项 > 表容量 %u;"
+                                "请减小 --k 或 --threads(idx 空间 2^20)\n",
+                        mt_spread ? "spread" : "same", Kc, (unsigned)VVA_MAP_SIZE);
+                return 1;
+            }
+        }
+
+        /* 列表是否全线程共享:contend(单行)/ c16 hot(共享热表) */
+        int shared_lists = (is_c15 && mt_contend) || (!is_c15 && mt_hotk);
+
+        /* 每线程数据区间距(私有布局):按内核流量形状 */
+        uint64_t span_t = 0;
+        if (is_c15 && !mt_shared) {
+            switch (mt_kern) {
+            case K_DAXPY: case K_SCALE: span_t = 16ULL * n_per; break;
+            case K_ADD:                 span_t = 24ULL * n_per; break;
+            case K_COPY_WORD:           span_t = 8ULL * n_per;  break;
+            default:                    span_t = 4ULL * n_per;  break;  /* read/write */
+            }
+        }
+
+        /* 归一化分母与每轮流量 */
+        size_t n_ops = 0, pt_ops = 0;
+        double bytes_round = 0;
+        if (is_c15) {
+            pt_ops = (mt_kern == K_DAXPY) ? 2 * n_per : n_per;   /* triad = mul+add */
+            n_ops = pt_ops * (size_t)T;
+            double per_el = (mt_kern == K_DAXPY || mt_kern == K_ADD) ? 24.0
+                          : (mt_kern == K_SCALE) ? 16.0
+                          : (is_copy ? 8.0 : 4.0);
+            bytes_round = per_el * (double)n_per * (double)T;
+        } else {
+            pt_ops = n_per;
+            n_ops = n_per * (size_t)T;
+            bytes_round = 4.0 * (double)n_per * (double)T;       /* u32 读流 */
+        }
+
+        struct mt_job *jd = calloc((size_t)T, sizeof(*jd));
+        struct mt_job *jc = calloc((size_t)T, sizeof(*jc));
+        struct pat_ctx *pats = calloc((size_t)T, sizeof(*pats));
+        if (!jd || !jc || !pats) { fprintf(stderr, "oom\n"); return 1; }
+
+        /* 共享列表:仅线程 0 生成一次(contend 单行 / c16 hot 同种子同列表) */
+        if (shared_lists) {
+            struct pat_ctx *pc = &pats[0];
+            pc->seed = (uint64_t)O.seed ^ (uint64_t)(uintptr_t)id;
+            pc->K = is_c15 ? 2 : K16;
+            pc->conv = calloc(is_c15 ? n_per : n_per, 8);
+            pc->direct = calloc(n_per, 8);
+            if (!pc->conv || !pc->direct) { fprintf(stderr, "oom\n"); return 1; }
+            if (is_c15) gen_hot(pc, n_per, 64);       /* 64B 单行,T 线程同写 */
+            else        gen_randidx(pc, n_per);       /* K=8 共享热表 */
+        }
+
+        size_t data_bytes = 0;
+        for (int t = 0; t < T; t++) {
+            struct pat_ctx *pc = &pats[t];
+            if (!shared_lists) {
+                pc->seed = (uint64_t)O.seed ^ (0x9E3779B9ULL * (uint64_t)(t + 1))
+                         ^ (uint64_t)(uintptr_t)id;
+                pc->K = is_c15 ? 2 : K16;
+                pc->idx_base = (!is_c15 && mt_spread) ? (uint64_t)t * K16 : 0;
+                pc->off_base = (is_c15 && !mt_shared) ? span_t * (uint64_t)t : 0;
+                if (is_c15 && dbl) {
+                    /* 基址流内核:gen 只填 extra_*;列表在任务装配循环建 */
+                    if (mt_kern == K_DAXPY)  gen_daxpy(pc, n_per);
+                    if (mt_kern == K_SCALE)  gen_scale(pc, n_per);
+                    if (mt_kern == K_ADD)    gen_add(pc, n_per);
+                } else {
+                    size_t cap1 = is_copy ? 2 * n_per + 2 : n_per;
+                    pc->conv = calloc(cap1, 8);
+                    pc->direct = calloc(cap1, 8);
+                    if (!pc->conv || !pc->direct) { fprintf(stderr, "oom\n"); return 1; }
+                    if (mt_kern == K_READ || is_write_seq)
+                        gen_seq(pc, 4ULL * n_per);    /* 私有区顺序流 */
+                    else if (is_copy)
+                        gen_copy(pc, 4ULL * n_per, 1);
+                    else if (!is_c15)
+                        gen_randidx(pc, n_per);
+                    if (is_copy)
+                        pc->dst_direct = &pc->direct[pc->n + 1];
+                }
+            } else if (t > 0) {
+                /* 共享布局:别名线程 0 的列表(地址逐元素相同 = 真·并发同址) */
+                pc->conv = pats[0].conv; pc->direct = pats[0].direct;
+                pc->dst_conv = pats[0].dst_conv;
+                pc->dst_direct = pats[0].dst_direct;
+                pc->n = pats[0].n; pc->data_size = pats[0].data_size;
+            }
+            if (pc->data_size > data_bytes) data_bytes = pc->data_size;
+        }
+
+        uint8_t *base = mmap_data(data_bytes, 1);
+        if (!base) return 1;
+        rc.K = Kc;
+        if (setup_map(&rc, base)) return 1;
+        for (int t = 0; t < T; t++) pats[t].data = base;
+
+        /* 数据填充:浮点内核按 double;u32 读/拷贝需要源值;contend 仅触碰 */
+        if (is_c15 && dbl) {
+            double *d = (double *)base;
+            for (size_t i = 0; i < data_bytes / 8; i++)
+                d[i] = (double)(i & 1023) * 0.5 + 0.25;
+        } else if (!mt_contend) {
+            uint32_t *w = (uint32_t *)base;
+            for (size_t i = 0; i < data_bytes / 4; i++) w[i] = (uint32_t)i;
+        }
+
+        /* 装配任务 + 公平性(§1.1) */
+        for (int t = 0; t < T; t++) {
+            struct pat_ctx *pc = &pats[t];
+            if (is_c15 && dbl) {
+                pc->conv = malloc(8); pc->direct = malloc(8);
+                if (!pc->conv || !pc->direct) { fprintf(stderr, "oom\n"); return 1; }
+                pc->conv[0] = pc->extra_x;
+                pc->direct[0] = (uint64_t)(uintptr_t)vva2va_pure(pc->extra_x);
+                if ((uint64_t)(uintptr_t)vva2va(pc->conv[0]) != pc->direct[0]) {
+                    fprintf(stderr, "公平性断言失败(c15 基址,t=%d)\n", t);
+                    return 2;
+                }
+                jd[t].n = jc[t].n = n_per;
+                jd[t].addr = pc->direct; jc[t].addr = pc->conv;
+                double sc = (mt_kern == K_SCALE) ? 2.0 : 1.1;
+                uint64_t bits; memcpy(&bits, &sc, 8);
+                jd[t].p1 = (uint64_t)(uintptr_t)vva2va_pure(pc->extra_y);
+                jd[t].p2 = (mt_kern == K_ADD)
+                         ? (uint64_t)(uintptr_t)vva2va_pure(pc->extra_z) : bits;
+                jc[t].p1 = pc->extra_y;
+                jc[t].p2 = (mt_kern == K_ADD) ? pc->extra_z : bits;
+            } else {
+                if (shared_lists && t > 0) {
+                    /* 公平性已由线程 0 校验(列表逐元素相同) */
+                } else {
+                    derive_direct(pc);
+                    if (check_fairness(pc)) return 2;
+                }
+                jd[t].n = jc[t].n = pc->n;
+                jd[t].addr = pc->direct; jc[t].addr = pc->conv;
+                jd[t].p1 = jd[t].p2 = jc[t].p1 = jc[t].p2 = 0;
+                if (is_copy) {
+                    jd[t].p1 = (uint64_t)(uintptr_t)pc->dst_direct;
+                    jc[t].p1 = (uint64_t)(uintptr_t)pc->dst_conv;
+                }
+            }
+            jd[t].k = kern_get(mt_kern, 0);
+            jc[t].k = kern_get(mt_kern, 1);
+        }
+
+        data_warm(base, data_bytes);
+        g_sink = 0;
+
+        if (mt_init(T) != T) { fprintf(stderr, "mt_init 失败\n"); return 1; }
+        struct mt_report_in ri = {
+            .jd = jd, .jc = jc, .T = T, .n_ops = n_ops,
+            .bytes_round = bytes_round, .pt_ops = (long)pt_ops,
+            .case_id = id,
+        };
+        if (is_c15)
+            snprintf(param, sizeof(param), "t=%d,kern=%s,n=%zu", T,
+                     mt_shared ? "shared" : mt_contend ? "contend" :
+                     mt_kern == K_DAXPY ? "triad" : mt_kern == K_SCALE ? "scale" :
+                     mt_kern == K_ADD ? "add" : mt_kern == K_COPY_WORD ? "copy" :
+                     mt_kern == K_WRITE ? "write" : "read",
+                     n_per);
+        else
+            snprintf(param, sizeof(param), "t=%d,k=%u,mode=%s,n=%zu", T, K16,
+                     mt_hotk ? "hot" : mt_spread ? "spread" : "same", n_per);
+        ri.param = param;
+        int r = mt_run_and_report(&ri, o, pmu, csvf);
+
+        mt_exit();
+        for (int t = 0; t < T; t++) {
+            /* 共享列表只由线程 0 持有所有权;dbl 为每线程 8 字节小数组 */
+            if (dbl || !shared_lists || t == 0) {
+                free(pats[t].conv); free(pats[t].direct);
+                pats[t].conv = pats[t].direct = NULL;
+            }
+        }
+        free(jd); free(jc); free(pats);
+        munmap(base, data_bytes);
+        return r;
+#endif
     }
 
     /* ---- 常规用例:列表 + 数据段 ---- */
@@ -764,9 +1158,9 @@ static int run_c13(struct opts *o, struct pmuset *pmu, FILE *csvf) {
 static void usage(void) {
     printf(
 "vva_bench —— VVA→VA 转换 overhead 测试框架(test.md)\n"
-"  --case c0..c14[,c..]   用例(c13 = 当前变体跑 c2+c4 扫描)\n"
-"  --k N                  表索引范围(C4/C5/C7/C9/C10)\n"
-"  --nops N               内核迭代数覆盖\n"
+"  --case c0..c16[,c..]   用例(c13 = 当前变体跑 c2+c4 扫描)\n"
+"  --k N                  表索引范围(C4/C5/C7/C9/C10/C16)\n"
+"  --nops N               内核迭代数覆盖(每线程迭代数,C15/C16)\n"
 "  --reps N               重复次数(默认 30,§3.6)\n"
 "  --bytes N              流/拷贝字节数(C1/C8)\n"
 "  --window N             C2 窗口字节(8..64)\n"
@@ -775,8 +1169,11 @@ static void usage(void) {
 "  --win-bytes N          C9 数据窗口\n"
 "  --block N              C8 块字节(64/128)\n"
 "  --mb N                 C12 数据足迹(MB)\n"
+"  --threads N            C15/C16 并行线程数(默认 min(nproc,8))\n"
 "  --sub X                子模式:c1 w;c6 cold;c8 word|nt;c11 r|rmw|w;c12 2m;\n"
-"                         c14 matmul(默认 daxpy)\n"
+"                         c14 matmul(默认 daxpy);\n"
+"                         c15 triad|read|scale|add|copy|write|shared|contend;\n"
+"                         c16 same|spread|hot(默认 same)\n"
 "  --csv FILE             CSV 追加输出(§5.1 schema)\n"
 "  --seed N               RNG 种子\n"
 "  --llc-mb N             evict 缓冲大小(默认 96)\n"
@@ -796,7 +1193,10 @@ static void list_cases(void) {
            "c5 表全冷              c6 指针追逐(cold子模式)  c7 跨段步长\n"
            "c8 拷贝带宽(word/nt)  c9 gather/scatter   c10 Zipf\n"
            "c11 读写混合(r/rmw/w)c12 TLB交互(2m)     c13 变体矩阵别名\n"
-           "c14 计算内核(daxpy/matmul)\n");
+           "c14 计算内核(daxpy/matmul)\n"
+           "c15 多线程并行访存(STREAM 家族:triad/read/scale/add/copy/write;\n"
+           "    shared 共享数据区;contend 单行写争用;--threads N)\n"
+           "c16 高并发表访问(same/spread/hot;--threads N,--k 扫描)\n");
 }
 
 int main(int argc, char **argv) {
@@ -812,13 +1212,14 @@ int main(int argc, char **argv) {
         {"block", 1, 0, 'B'}, {"mb", 1, 0, 'M'}, {"sub", 1, 0, 'S'},
         {"csv", 1, 0, 'o'}, {"seed", 1, 0, 'e'}, {"llc-mb", 1, 0, 'L'},
         {"flush", 1, 0, 'F'}, {"raw-l2m", 1, 0, 'R'}, {"table-hp", 0, 0, 'H'},
+        {"threads", 1, 0, 'j'},
         {"variant", 1, 0, 'V'}, {"arch", 1, 0, 'A'}, {"enc", 1, 0, 'E'},
         {"tag", 1, 0, 'T'}, {"base", 1, 0, 'P'}, {"isa", 1, 0, 'I'},
         {"force", 0, 0, 'f'}, {"no-ins-check", 0, 0, 'x'}, {"list", 0, 0, 'l'},
         {"help", 0, 0, 'h'}, {0, 0, 0, 0}
     };
     int ch;
-    while ((ch = getopt_long(argc, argv, "c:k:n:r:b:w:s:t:W:B:M:S:o:e:L:F:R:HV:A:E:T:P:Ifxlh", lo, NULL)) >= 0) {
+    while ((ch = getopt_long(argc, argv, "c:k:n:r:b:w:s:t:W:B:M:S:o:e:L:F:R:HV:A:E:T:P:Ifxlhj:", lo, NULL)) >= 0) {
         switch (ch) {
         case 'c': O.cases = optarg; break;
         case 'k': O.k = atol(optarg); break;
@@ -837,6 +1238,7 @@ int main(int argc, char **argv) {
         case 'L': O.llc_mb = atol(optarg); break;
         case 'F': O.flush = optarg; break;
         case 'R': O.raw_l2m = strtol(optarg, NULL, 0); break;
+        case 'j': O.threads = atol(optarg); break;
         case 'H': O.table_hp = 1; break;
         case 'V': O.variant = optarg; break;
         case 'A': O.arch = optarg; break;

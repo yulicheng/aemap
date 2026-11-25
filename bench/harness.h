@@ -32,6 +32,10 @@ struct pmuset {
  * AArch64 默认 0x17(PMUv3 架构化 L2D_CACHE_REFILL)。 */
 void pmu_open(struct pmuset *s, int want_l2m, long raw_l2m);
 void pmu_close(struct pmuset *s);
+/* 精简组:仅 cycles+instructions 两个 HARDWARE 事件。多线程场景(C15/C16)
+ * 每线程各开一组,计数器预算有限;且不走 HW_CACHE 双编码探测(其惰性全局
+ * 初始化 g_cache_rev 非线程安全,mt_worker 中只能用本函数)。 */
+void pmu_open_pair(struct pmuset *s);
 void pmu_reset(struct pmuset *s);
 void pmu_start(struct pmuset *s);   /* ENABLE 组 */
 void pmu_stop(struct pmuset *s);    /* DISABLE 组 */
