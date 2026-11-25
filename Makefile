@@ -27,6 +27,10 @@
 # ⚠ -fno-tree-vectorize -fno-slp-vectorize 是 Δins/op 硬校验(design §8.1)的前提:
 #   向量化会把 direct 实例的访存循环改成 SIMD,而 conv 实例因 volatile asm
 #   保持标量,kernel_defs.h 的"逐指令对应"被破坏,Δins 失去意义。
+# ⚠ -fno-unroll-loops 同理(design §447"双实例对称性"):clang -O2 会把 direct
+#   实例按 4× 展开、conv 实例因 volatile asm 保持标量,Δins 被灌入 ~2 条/op 的
+#   循环开销不对称(实测 clang c2 Δins=7.25 = 5 + 2.25)。gcc -O2 本就不展开
+#   该循环,加此开关对 gcc codegen 无影响(已用 make codegen 复核)。
 
 CC      ?= gcc
 ARCH    ?= $(shell uname -m)
@@ -91,8 +95,8 @@ BIN     ?= build/vva_bench
 W       ?= 16
 
 CFLAGS   := -std=c11 -O2 -g -Wall -Wextra
-# Δins 硬校验前提:禁用自动向量化(见文件头说明;gcc/clang 均接受 tree- 前缀形式)
-CFLAGS   += -fno-tree-vectorize -fno-tree-slp-vectorize
+# Δins 硬校验前提:禁用自动向量化与自动展开(见文件头说明;gcc/clang 均接受)
+CFLAGS   += -fno-tree-vectorize -fno-tree-slp-vectorize -fno-unroll-loops
 CPPFLAGS := -I. -Iinclude -Iarch/$(ARCH) -Ibench -D_GNU_SOURCE
 
 # 编码宏(vva_impl.h 派发)

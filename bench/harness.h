@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* ---------------- PMU(perf_event_open + 组读,test.md §3.1/§3.2) ---------------- */
+/* ---------------- PMU(perf_event_open 组 + 逐 fd 单独读,test.md §3.1/§3.2) ---------------- */
 
 enum pmu_metric {
     PMU_CYC,      /* cycles                     */
@@ -35,7 +35,7 @@ void pmu_close(struct pmuset *s);
 void pmu_reset(struct pmuset *s);
 void pmu_start(struct pmuset *s);   /* ENABLE 组 */
 void pmu_stop(struct pmuset *s);    /* DISABLE 组 */
-void pmu_read(struct pmuset *s);    /* 组读 + 缩放校正,结果在 s->val[] */
+void pmu_read(struct pmuset *s);    /* 逐 fd 单独读 + 缩放校正,结果在 s->val[] */
 
 /* 回退计时:x86 = lfence;rdtsc(串行化,墙钟交叉校验);AArch64 = cntvct_el0
  * (固定频率架构定时器,不是 CPU cycles,仅作墙钟回退,test.md §3.1)。 */

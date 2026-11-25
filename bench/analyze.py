@@ -193,7 +193,7 @@ def ins_check(rows):
             verdict = f"✗ 构建期望 {int(r.ins_expect)} ≠ §8.1 文档 {exp_doc}"
             fails += 1
         else:
-            verdict = "n/a(本机无 PMU,run_all 以 make codegen 静态核对)"
+            verdict = "n/a(非单转换循环内核,不参与硬校验;codegen 静态核对)"
         t.append([r.arch, r.variant, r.case, f"{int(r.ins_expect)}",
                   f"{exp_doc}", verdict])
     table(["arch", "variant", "case", "构建期望", "§8.1 文档", "校验"], t)

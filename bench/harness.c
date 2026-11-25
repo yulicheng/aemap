@@ -1,7 +1,13 @@
 /* bench/harness.c —— 计时/PMU/缓存控制/统计实现(test.md §3)
  *
- * PMU:perf_event_open 组(cycles 领队)+ PERF_FORMAT_GROUP 一次 read() 读全组,
- * 用 time_enabled/time_running 做多路复用缩放校正;用户态计数(exclude_kernel=1)。
+ * PMU:perf_event_open 组(cycles 领队),组关系由 open 的 gfd 建立(组内
+ * ENABLE/DISABLE 同步);读取用逐 fd 单独 read(),布局 [val, ena, run(, id)],
+ * 按各自事件的 time_enabled/time_running 做多路复用缩放校正;用户态计数
+ * (exclude_kernel=1)。不用 PERF_FORMAT_GROUP 组读:部分内核(本机 26.04,
+ * 7.0.0-43)组读布局与上游不同 —— time_enabled/run 排在事件对之前(上游在
+ * 尾部),GROUP 解析歧义;单独读布局两代内核一致。
+ * HW_CACHE 事件双编码:上游 cache_id<<16|op<<8|result,本机内核字段反排为
+ * result<<16|op<<8|cache_id,先试上游、EINVAL 再试反转。
  * 内核单次 ~ms 量级,read() 开销可忽略;无 perf 环境回退 rdtsc/cntvct 墙钟。
  *
  * 缓存控制:表 flush 用 clflush(x86)/ dc civac(AArch64,启动时 SIGILL 探测
@@ -48,7 +54,11 @@ static void attr_init(struct perf_event_attr *a, uint32_t type, uint64_t cfg) {
     a->disabled = 1;
     a->exclude_kernel = 1;   /* 内核只跑用户态 */
     a->exclude_hv = 1;
-    a->read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID
+    /* 不带 PERF_FORMAT_GROUP:逐 fd 单独读(组关系由 open 的 gfd 建立,与
+     * read_format 无关)。部分内核(本机 26.04, 7.0.0-43)组读布局与上游
+     * 不同 —— time_enabled/run 排在事件对之前(上游在尾部),GROUP 解析
+     * 歧义;单独读布局 [val, ena, run, id] 两代内核一致。 */
+    a->read_format = PERF_FORMAT_ID
                    | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
 }
 
@@ -56,8 +66,46 @@ static void attr_init(struct perf_event_attr *a, uint32_t type, uint64_t cfg) {
 #define LLC_MISS_CFG  ((PERF_COUNT_HW_CACHE_LL  << 16) | (PERF_COUNT_HW_CACHE_OP_READ  << 8) | PERF_COUNT_HW_CACHE_RESULT_MISS)
 #define DTLB_MISS_CFG ((PERF_COUNT_HW_CACHE_DTLB << 16) | (PERF_COUNT_HW_CACHE_OP_READ  << 8) | PERF_COUNT_HW_CACHE_RESULT_MISS)
 
+/* HW_CACHE 双编码:上游 cache_id<<16|op<<8|result;部分内核(本机 26.04,
+ * 7.0.0-43)字段反排为 result<<16|op<<8|cache_id。
+ * ABI 判别:用 LL-miss(std=0x20001 / rev=0x10002,两式互斥)做一次性探测。
+ * 不能用 l1d 判别 —— 其 std 编码 0x00001 在反排解码下恰为合法的
+ * L1I-access,会静默打开错误事件(实测 l1m 恒 0 的根因)。 */
+static int g_cache_rev = -1;   /* -1 未探测;0 = 上游编码;1 = 反排编码 */
+
+static int peo_cache_cfg(int leader, uint64_t cfg) {
+    struct perf_event_attr a;
+    attr_init(&a, PERF_TYPE_HW_CACHE, cfg);
+    return (int)sys_perf_event_open(&a, 0, -1, leader, 0);
+}
+
+static int open_hw_cache(int leader, uint64_t cache_id) {
+    const uint64_t std = (cache_id << 16) | ((uint64_t)PERF_COUNT_HW_CACHE_OP_READ << 8)
+                       | PERF_COUNT_HW_CACHE_RESULT_MISS;
+    const uint64_t rev = ((uint64_t)PERF_COUNT_HW_CACHE_RESULT_MISS << 16)
+                       | ((uint64_t)PERF_COUNT_HW_CACHE_OP_READ << 8) | cache_id;
+    if (g_cache_rev < 0) {
+        const uint64_t ll_std = (2u << 16) | ((uint64_t)PERF_COUNT_HW_CACHE_OP_READ << 8)
+                              | PERF_COUNT_HW_CACHE_RESULT_MISS;
+        const uint64_t ll_rev = ((uint64_t)PERF_COUNT_HW_CACHE_RESULT_MISS << 16)
+                              | ((uint64_t)PERF_COUNT_HW_CACHE_OP_READ << 8) | 2u;
+        int pfd = peo_cache_cfg(leader, ll_std);
+        if (pfd >= 0) { close(pfd); g_cache_rev = 0; }
+        else if ((pfd = peo_cache_cfg(leader, ll_rev)) >= 0) { close(pfd); g_cache_rev = 1; }
+        else g_cache_rev = 0;   /* LL 双编码皆败:按上游顺序逐事件回退 */
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t cfg = (pass == 0) ? (g_cache_rev ? rev : std) : (g_cache_rev ? std : rev);
+        int fd = peo_cache_cfg(leader, cfg);
+        if (fd >= 0) return fd;
+        if (pass == 0 && errno != EINVAL) return -1;
+    }
+    return -1;
+}
+
 void pmu_open(struct pmuset *s, int want_l2m, long raw_l2m) {
     memset(s, 0, sizeof(*s));
+    for (int i = 0; i < PMU_NMET; i++) s->fd[i] = -1;
 
     struct pmu_attr_spec list[PMU_NMET];
     int m = 0;
@@ -72,8 +120,13 @@ void pmu_open(struct pmuset *s, int want_l2m, long raw_l2m) {
     int leader = -1;
     for (int i = 0; i < m; i++) {
         struct perf_event_attr a;
-        attr_init(&a, list[i].type, list[i].cfg);
-        int fd = (int)sys_perf_event_open(&a, 0, -1, leader, 0);
+        int fd;
+        if (list[i].type == PERF_TYPE_HW_CACHE) {
+            fd = open_hw_cache(leader, list[i].cfg >> 16);   /* cfg 高 16 位 = cache_id */
+        } else {
+            attr_init(&a, list[i].type, list[i].cfg);
+            fd = (int)sys_perf_event_open(&a, 0, -1, leader, 0);
+        }
         if (fd < 0) {
             if (leader < 0) return;        /* cycles 打不开 → perf 整体不可用 */
             continue;                       /* 个别事件缺,跳过 */
@@ -103,30 +156,22 @@ void pmu_stop (struct pmuset *s) { group_ioctl(s, PERF_EVENT_IOC_DISABLE, PERF_I
 
 void pmu_read(struct pmuset *s) {
     for (int i = 0; i < PMU_NMET; i++) s->val[i] = 0;
+    s->scaled = 0;
     if (!s->ok) return;
 
-    uint64_t buf[4 + 2 * PMU_NMET];
-    int leader = s->fd[PMU_CYC] >= 0 ? s->fd[PMU_CYC] : s->fd[PMU_INS];
-    ssize_t nr = read(leader, buf, sizeof(buf));
-    if (nr < 8) return;
-
-    uint64_t cnt = buf[0];
-    if ((size_t)nr < (1 + 2 * cnt) * 8) return;
-    double ena = 0, run = 0;
-    if ((size_t)nr >= (1 + 2 * cnt + 2) * 8) {
-        ena = (double)buf[1 + 2 * cnt];
-        run = (double)buf[1 + 2 * cnt + 1];
-    }
-    double scale = (ena > 0 && run > 0) ? ena / run : 1.0;
-    s->scaled = (ena > 0 && run > 0 && run < ena * 0.99);
-
-    for (uint64_t k = 0; k < cnt; k++) {
-        uint64_t v = buf[1 + 2 * k], id = buf[2 + 2 * k];
-        for (int i = 0; i < PMU_NMET; i++)
-            if (s->fd[i] >= 0 && s->id[i] == id) {
-                s->val[i] = (uint64_t)((double)v * scale);   /* 多路复用校正(§7) */
-                break;
-            }
+    /* 逐 fd 单独读,布局 [val, ena, run(, id)](上游与本机内核一致)。
+     * 多路复用校正按各自事件的 time_enabled/time_running(§7)。 */
+    for (int i = 0; i < PMU_NMET; i++) {
+        if (s->fd[i] < 0) continue;
+        uint64_t b[8];
+        ssize_t nr = read(s->fd[i], b, sizeof(b));
+        if (nr < 8) continue;
+        double v = (double)b[0], scale = 1.0;
+        if (nr >= 24 && b[1] > 0 && b[2] > 0 && b[1] >= b[2]) {
+            scale = (double)b[1] / (double)b[2];
+            if (b[2] < (b[1] * 99) / 100) s->scaled = 1;
+        }
+        s->val[i] = (uint64_t)(v * scale);
     }
 }
 

@@ -300,12 +300,14 @@ static int run_and_report(struct runctx *rc, const char *case_id, struct opts *o
         dmed_op[m] = rc->n_ops ? med[m] / (double)rc->n_ops : 0.0;
     }
 
-    /* Δins/op 硬校验(design §8.1:逐指令对应,±0;仅单转换循环内核启用) */
+    /* Δins/op 硬校验(design §8.1:逐指令对应;仅单转换循环内核启用)。
+     * 容差 0.02 条/op:scale = time_enabled/time_running 含 reset→enable 的
+     * 微小调度间隙,严格相等会被 5×ε 误判;真实 codegen 差异 ≥1 条 ≫ 容差。 */
     long expect = VVA_CONV_INSN;
     int ins_ok = -1;
     if (rc->is_loop_read && pmu->ok && expect > 0 && !o->no_ins_check) {
         double dins_op = dmed_op[1];
-        ins_ok = (dins_op == (double)expect) ? 1 : 0;
+        ins_ok = (dins_op > (double)expect - 0.02 && dins_op < (double)expect + 0.02) ? 1 : 0;
     }
 
     /* ---- 人类可读输出 ---- */
@@ -591,7 +593,12 @@ static int case_run(const char *id, struct opts *o, struct pmuset *pmu, FILE *cs
         enum kern_id kk = K_READ;
         const char *md = "r";
         if (o->sub && (!strcmp(o->sub, "w") || !strcmp(o->sub, "W"))) { kk = K_WRITE; md = "w"; }
-        else if (o->sub && (!strcmp(o->sub, "rmw") || !strcmp(o->sub, "RMW"))) { kk = K_RMW; md = "rmw"; }
+        else if (o->sub && (!strcmp(o->sub, "rmw") || !strcmp(o->sub, "RMW"))) {
+            kk = K_RMW; md = "rmw";
+            rc.is_loop_read = 0;   /* RMW = 每访问两次 A2P(load+store),非单转换循环,
+                                    * Δins 契约(§8.1)仅定义于 k_read;实测 = 2×5+1(重载 VVA),
+                                    * 以 codegen 存档为证,不参与硬校验 */
+        }
         rc.K = 2;
         rc.kd = kern_get(kk, 0); rc.kc = kern_get(kk, 1);
         snprintf(param, sizeof(param), "span=%llu,mode=%s", (unsigned long long)span_v, md);
