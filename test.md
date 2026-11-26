@@ -51,8 +51,9 @@ CLI（`bench/` 产物）：
 vamap_bench --suite correctness                     # 正确性门槛
 vamap_bench --test T6 [参数...] [--out results/t6.csv]
 vamap_bench --matrix --level smoke|standard|full --out results/
-参数：--threads N  --invalid 0|0.25|0.5|0.75|1  --invalid-scope rand|target
-      --latency 10us|100us|1ms|10ms  --latency-mode spin|sleep  --alias 0|1
+参数：--threads N[,N…]  --idx-mode private|shared  --invalid 0|0.25|0.5|0.75|1
+      --invalid-scope rand|target  --latency 10us|100us|1ms|10ms
+      --latency-mode spin|sleep  --alias 0|1
       --ops N  --reps N  --max-creates-per-rep K  --pin 0-7
 ```
 
@@ -79,8 +80,10 @@ vamap_bench --matrix --level smoke|standard|full --out results/
   - `rand`：从全部 `2^20` 表项中随机选 `⌊ratio × 2^20⌋` 个置无效（`entry=0`），
     对随机访问类 pattern，预期 creates = ratio × 实际触及的不同表项数；
   - `target`：只在 pattern 将触及的表项集合中选 ratio 比例的成员置无效（首触类场景可控）；
-- **全表有效/大表扫描**：当触及表项数超过可用 region 数（严格 48 位 `2^16−1`，
-  17 位字段 `2^17−1`）时，`--alias 1` 把多个 idx 预填到少量 region，使 `2^20` 表项
+- **全表有效/大表扫描**：当触及表项数超过可用 region 数（= `REGION_COUNT − 1`，平台相关，
+  见 design.md §6.2 回退表：LA57/ARM64 52 位 VA 至多 `2^17−1`、ARM64 48 位 VA 至多
+  `2^15−1`、x86-64 4 级页表至多 `2^14−1`；严格 48 位模式另受 `2^16−1` 分配上限约束）时，
+  `--alias 1` 把多个 idx 预填到少量 region，使 `2^20` 表项
   全部有效且数据工作集固定；alias 仅用于表 cache/overhead 测量，映射正确性由 C1/C2 覆盖；
 - **每次重复前重置表状态**：创建的表项回滚、失效集合重布 —— 保证瞬态行为可复现，
   每次重复测得相同的"瞬态 + 稳态"混合；
@@ -136,10 +139,11 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 
 ### T3–T6 STREAM 四种访问模式
 
-经典 STREAM 内核的 VVA 版本。默认 **STREAM-M 变体**——把数据切成 M 个 16 MiB 分块
-（默认 M = 256，总数据量 4 GiB；各分块占独立映射索引），按轮转顺序流式扫过，
-使触及表项数可控、无效率矩阵有意义；`M=1` 时只保留一个热表项，作为经典 STREAM
-的微变体 T3a–T6a（此时仅 0%/100% 两种无效率有意义，其余比例退化）。
+经典 STREAM 内核的 VVA 版本。默认 **STREAM-M 变体**——把每个数组切成 M 个 16 MiB 分块
+（默认 M = 256，即每数组 M × 16 MiB = 4 GiB；每个分块占一个独立映射索引——多数组内核中
+各数组的第 j 块共用索引 j 的 4 GiB 窗口、以不同 offset 排布，故触及表项数恒为 M），
+按轮转顺序流式扫过，使触及表项数可控、无效率矩阵有意义；`M=1` 时只保留一个热表项，
+作为经典 STREAM 的微变体 T3a–T6a（此时仅 0%/100% 两种无效率有意义，其余比例退化）。
 
 | ID | 内核 | 每迭代访存 | 转换次数 |
 |----|------|------------|----------|
@@ -151,7 +155,9 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 - **变体**：
   - **v2 巨数组**：单数组 > 4 GiB（如 8 GiB），跨 2+ 个映射，考察索引边界跨越；
   - **v3 首触**：初始 100% 无效，创建成本按首触摊销（与矩阵的 target 模式联动）。
-- **表行为**：M 个热表项（默认 256 → 数据 + 表项均可驻留 L1/L2）；
+- **表行为**：M 个热表项（默认 256 条 × 8 B = 2 KB，常驻 L1）；数据侧每数组 M × 16 MiB
+  （默认 4 GiB）远超各级缓存、为 DRAM 带宽受限（STREAM 的测量本意），单个 16 MiB 分块
+  也超出 L1/L2，M=1 变体的 16 MiB 工作集可驻留 LLC（视主机 LLC 容量而定）；
 - **预期**：0% 无效时带宽下降 5–30%（每访存多 1 次 load 占用 load 端口 + 转换链）。
 
 ### T7 步长访问

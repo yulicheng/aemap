@@ -53,11 +53,14 @@ region(idx) == 0 表示该索引尚未建立映射
 ```
 
 - 映射允许多对一：多个 idx 可指向同一 region；区域号按需分配，同时活跃的映射数
-  受 region 号空间限制（17 位字段为 `2^17−1`，严格 48 位模式为 `2^16−1`）；
+  受 region 号空间限制（17 位字段为 `2^17−1`，严格 48 位模式为 `2^16−1`；
+  实际可用数还受平台用户 VA 上限约束，见 §6.2 的 `REGION_COUNT` 回退表）；
 - 表项数 `2^20` 大于可用 region 数，因此“全表有效”只能通过多对一预填（alias）实现；
   正常运行路径仍按需分配/复用 region；
 - **运行时保留 region 0 不分配**，因此"表项整字为 0 ⇔ 无效"成立，有效性判断无需独立 valid 位；
-- 严格 48 位虚地址模式下区域号分配限制在 `[1, 2^16-1]`（即 bit48 恒 0，可用空间 256 TiB − 4 GiB）；
+- 严格 48 位虚地址模式下区域号分配限制在 `[1, 2^16-1]`（即 bit48 恒 0，VA 值域上界
+  256 TiB − 4 GiB；用户态可访问空间随平台而定——ARM64 48 位 VA 为完整 256 TiB，
+  x86-64 4 级页表用户空间仅 128 TiB，见 §6.2）；
   17 位字段宽度保留，便于将来扩展到 `2^49` 地址空间。两种取法对快路径指令形态没有影响。
 
 > **规格说明**：readme 原文为"将 VVA 高 51 到 32 位转换成真实的 VA 高 48 到 32 位"。
@@ -103,7 +106,7 @@ entry = (uint64_t)region << 32;
 include/vamap.h            # 公共 API、表项编码、内联转换、平台选择
 src/vamap_runtime.c        # 运行时：init/创建/销毁/时延模拟/区域与锁管理
 src/vamap_arch.c           # （可选）手写汇编快路径
-bench/                     # 测试框架（见 test.md）：harness / patterns / timer / perf
+bench/                     # 测试框架（见 test.md）：harness / patterns / state / timer / runtime / report
 tests/                     # 正确性套件（见 test.md §5）
 scripts/check_fastpath.sh  # objdump 校验快路径指令形态
 design.md  test.md
@@ -167,6 +170,8 @@ orq   %rcx, %rax                ; rax = VA = entry | offset
 - **test/je 宏融合**为 1 uop；`(%rdx,%rcx,8)` 使用比例变址，无需额外 lea；
 - 指令数：**strict 8 条 / 约 6 uops（循环内）**；若构建约定 tag≡0
   （`VAMAP_FAST_TAG0`），删除 `andl` 后为 **7 条 / 约 5 uops**；
+  构建系统以宏 `VAMAP_CONV_INSNS`（strict 8 / fast 7）把该数值暴露给测试框架，
+  供 `instr_per_op` 断言使用（test.md §9.3）；
 - BMI2 的 `shrx`/`bextr` 可把“取索引”压到 1 条，strict 约 6 条；合并的
   零扩展 + OR 仍不能省。
 - 若要求 tag 任意取值都不影响结果（readme 的“52 位及以上忽略”），保留 `andl` 作为默认；
@@ -197,9 +202,9 @@ bfi  x10, x0, #0, #32           ; 低 32 位插入 offset，保留表项高位
 | 方案 | 表项编码 | 合并方式 | 快路径（x86-64） | 评价 |
 |------|----------|----------|------------------|------|
 | **本设计** | `region<<32`，无效 = 0 | 零扩展 + `or` 合并 | mov/shr/and/load/test+je/mov/or = 8 条（~6 uops；fast 去 and 为 7 条） | 1 次表 load，无独立 valid 位 |
-| valid 位放 bit0 | `region<<32 \| 1` | and+or 掩掉 valid 位 | +2 条 | 判断与合并都要掩码 |
-| 存完整 64 位基址 | 全地址 | `and ~0xFFFFFFFF` + or | +2 条 | 表项信息冗余，合并更贵 |
-| 通用 C 合并 | 同本设计 | `(e & ~0xFFFFFFFF) \| (vva & 0xFFFFFFFF)` | 编译器可优化至同本设计 | 可移植回退 |
+| valid 位放 bit0 | `region<<32 \| 1` | and+or 掩掉 valid 位 | +1 条（共 9 条：合并前需 `and` 清 bit0） | 判断仍可整字判零（valid 表项恒非零），合并多一条掩码 |
+| 存完整 64 位基址 | 全地址 | `and ~0xFFFFFFFF` + or | +1 条（共 9 条） | 表项信息冗余，合并多一条掩码；若限定基址 4 GiB 对齐并改用 `add` 合并则与本设计同价（等价于本设计编码） |
+| 通用 C 合并 | 同本设计 | 直接 `e \| (uint32_t)vva`（朴素写法 `(e & ~0xFFFFFFFF) \| (vva & 0xFFFFFFFF)` 多 1 条掩码） | 与本设计同价（编译器生成零扩展 + or） | 可移植回退 |
 | 无检查 fault 版 | 同本设计 | 无 test/je | 6 条（strict；fast 5 条）、无分支 | 依赖 SIGSEGV，慢路径成本高，见 5.7 |
 
 在"必须显式判断有效性、无效时调用运行时函数，且忽略 tag"这一约束下，本形态的
@@ -247,9 +252,11 @@ static inline int32_t vload32(uint64_t vva, const uint64_t *tbl)
 }
 ```
 
-> 慢路径 `call` 会破坏 ABI 规定的 caller-saved 寄存器；上表已列出通用寄存器，
-> 若内核中同时有活跃的浮点/向量寄存器，还需按 ABI 追加 `xmm0–xmm15`（或直接使用
-> C 版 `vload32`）。合并同样必须“零扩展 + OR”，不能只写 `%eax`。
+> 慢路径 `call` 会破坏 ABI 规定的 caller-saved 寄存器；上述 clobber 列表已覆盖全部
+> caller-saved 通用寄存器（rax/rcx/rdx/rsi/rdi/r8–r11），因此输入操作数会被分配到
+> callee-saved 寄存器，`call` 之后仍有效。若内核中同时有活跃的浮点/向量寄存器，
+> 还需按 ABI 追加 `xmm0–xmm15`（或直接使用 C 版 `vload32`）。合并同样必须
+> “零扩展 + OR”，不能只写 `%eax`。
 
 ARM64 版本同构（`ubfx/add/ldar/cbz/bfi` + `bl vamap_slow_create_fill`）。
 
@@ -271,7 +278,7 @@ typedef struct {
     uint64_t create_latency_ns;   /* 映射建立时延；测试取 10us/100us/1ms/10ms */
     int      latency_mode;        /* VAMAP_LATENCY_SPIN(默认) / VAMAP_LATENCY_SLEEP */
     uint32_t lock_stripes;        /* 慢路径锁条带数，默认 4096（2 的幂） */
-    int      strict_48bit;        /* 区域号限制在 [1, 2^16-1] */
+    int      strict_48bit;        /* 置位时区域号分配限制在 [1, 2^16-1]（48 位 VA 兼容），且不超过 REGION_COUNT-1 */
 } vamap_cfg;
 
 int      vamap_init(const vamap_cfg *cfg);
@@ -302,11 +309,25 @@ vamap_stats vamap_get_stats(void);
 
 - `mmap(NULL, (size_t)REGION_COUNT<<32, PROT_READ|PROT_WRITE,
   MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)`
-  预留 `2^17 × 4 GiB = 512 TiB` **虚拟**空间作为真实 VA 竞技场（`MAP_NORESERVE` 下仅占虚拟地址）；
-  若平台用户 VA 上限不足（x86-64 4 级页表约 128 TiB），按 2 的幂回退到 `2^16/2^15`
-  个区域，并在测试元数据中记录实际 `REGION_COUNT`；严格 48 位模式使用 `2^16` 个区域（256 TiB）；
-- 可用 region 数（`2^17−1`，严格 48 位 `2^16−1`）小于表项数 `2^20`；需要“全表有效”时
-  测试框架用 `vamap_map_alias` 预填到少量 region，正常创建在 region 耗尽时返回错误；
+  预留 `REGION_COUNT × 4 GiB` **虚拟**空间作为真实 VA 竞技场（`MAP_NORESERVE` 下仅占虚拟地址）。
+  满配 `2^17` 个区域 = 512 TiB，要求平台用户 VA 严格大于 512 TiB（x86-64 5 级页表 LA57、
+  ARM64 52 位 VA 等）；`REGION_COUNT` 按平台用户 VA 上限自高向低按 2 的幂回退，
+  取首个可成功预留并为进程自身映射留出余量的档位，并在测试元数据中记录实际值：
+
+  | 平台（用户 VA 上限） | 最大 `REGION_COUNT` | 可用 region 数上限 | 竞技场 |
+  |----------------------|---------------------|--------------------|--------|
+  | x86-64 5 级（LA57，用户 64 PiB）/ ARM64 52 位 VA（用户 4 PiB） | `2^17` | `2^17−1` | 512 TiB |
+  | ARM64 48 位 VA（用户 `2^48` = 256 TiB） | `2^15` | `2^15−1` | 128 TiB |
+  | x86-64 4 级（用户空间 `2^47` = 128 TiB，canonical） | `2^14` | `2^14−1` | 64 TiB |
+
+  说明：x86-64 4 级页表的用户地址必须为 canonical 形式，region ≥ `2^15` 的 VA（≥ 128 TiB）
+  用户态不可访问；ARM64 48 位 VA 的用户空间恰为 256 TiB，`2^16` 档（256 TiB 竞技场）会占满
+  全部用户地址而失败。故两平台的回退终点分别为 `2^14` 与 `2^15`，而非 `2^16/2^15`。
+  严格 48 位模式的分配上限 `[1, 2^16−1]` 仅在第一档可全容量实现，其余档位的实际可用
+  region 数取 `min(2^16−1, REGION_COUNT−1)`；
+- 可用 region 数（上限 `2^17−1`，平台相关，见上表；严格 48 位模式再叠加 `2^16−1` 分配上限）
+  恒小于表项数 `2^20`；需要“全表有效”时测试框架用 `vamap_map_alias` 预填到少量 region，
+  正常创建在 region 耗尽时返回错误；
 - region `r` 的真实基址 = `arena + ((uint64_t)r << 32)`；
 - 分配区域号空闲链（region 0 保留）、初始化条带锁、校准 TSC。
 
@@ -354,7 +375,7 @@ void *vamap_slow_create_fill(uint64_t vva)
      模拟系统调用/IO 型分配器；墙钟时间包含调度延迟，CPU 占用不计入。
      两种模式的语义差异在 test.md §4.3 说明，默认 SPIN。
 5. **region 号耗尽**：`region_alloc()` 返回 0 时创建失败（返回 `NULL`），不发布表项；
-   benchmark 通过 `vamap_map_alias` 预填或缩小表项空间避免（test.md §4.2）。
+   benchmark 通过 `vamap_map_alias` 预填或缩小表项空间避免（test.md §4.2/§4.4）。
 
 ### 6.4 映射销毁
 
