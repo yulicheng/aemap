@@ -18,7 +18,7 @@
 |------|------|
 | `ns_per_op` / `cycles_per_op` | 每访存耗时（主指标） |
 | `overhead_pct` | 相对基线 B0 的开销百分比：`(T_conv − T_base) / T_base × 100%` |
-| `instr_per_op` | 每访存指令数（应为 B0 + `VAMAP_CONV_INSNS`；x86-64 strict 默认 8、fast 7，表基址驻留寄存器） |
+| `instr_per_op` | 每访存指令数（应为 B0 + `VAMAP_CONV_INSNS`；x86-64 strict 默认 8、fast 7，表基址驻留寄存器；使用 BMI2 `shrx` 的变体为 strict 7、fast 6） |
 | `l1m/llc/dtlb/br_per_op` | 每访存 L1 miss、LLC miss、dTLB miss、分支 miss |
 | `creates / destroys` | 慢路径事件计数（与解析预期值比对，一致性校验） |
 | `slow_ns_total / slow_pct` | 慢路径累计耗时及占比（运行时统计） |
@@ -28,7 +28,7 @@
 | 编号 | 被测路径 | 说明 |
 |------|----------|------|
 | B0 | 直接 VA 访存内核 | 同一访存序列、直接指针，无转换 —— overhead 的分母 |
-| B1 | 转换 + 0% 无效 | 全部表项有效，纯快路径成本 |
+| B1 | 转换 + 0% 无效 | 触及表项全部有效（必要时 alias 预填），纯快路径成本 |
 | B2 | 转换 + 按矩阵无效比例与时延 | 完整快慢路径混合 |
 
 校验点：**B1 在四种时延下结果必须一致**（0% 无效时慢路径不触发），作为框架自检。
@@ -76,17 +76,31 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 
 ### 4.2 无效比例语义
 
-- **初始状态**：按 `invalid_scope` 选择失效集合：
-  - `rand`：从全部 `2^20` 表项中随机选 `⌊ratio × 2^20⌋` 个置无效（`entry=0`），
-    对随机访问类 pattern，预期 creates = ratio × 实际触及的不同表项数；
+- **初始状态**：先用 `vamap_map_alias`（不计时延）按 pattern 把其触及的表项预填为有效，
+  再按 `invalid_scope` 置无效；`invalid_ratio` 是"初始无效表项占触及集合的比例"。
+  预填走 alias 而非 `vamap_map_create`，避免重置阶段就付出 T × create_latency：
+  - `rand`：从已建立表项中随机选 `⌊ratio × 已建立数⌋` 个置无效（`entry=0`）；若用
+    `--alias 1` 全表预填，则等价于从 `2^20` 个表项中随机选。对随机访问类 pattern，
+    预期 creates = invalid_ratio_actual × 实际触及的不同表项数；
   - `target`：只在 pattern 将触及的表项集合中选 ratio 比例的成员置无效（首触类场景可控）；
+- **比例可实现性**：集合大小为 N 时实际失效数为 `round(ratio × N)`，结果记录实际值；
+  N < 4 的 pattern（如 T1、T10 的 W=1、T11-shared、T13/T14 的单表项形态）使用"4 份等价表项"变体
+  （同一内核轮转 4 个等价映射）来精确覆盖 0/25/50/75/100%，原始单表项微变体只报告 0/100%；
 - **全表有效/大表扫描**：当触及表项数超过可用 region 数（= `REGION_COUNT − 1`，平台相关，
   见 design.md §6.2 回退表：LA57/ARM64 52 位 VA 至多 `2^17−1`、ARM64 48 位 VA 至多
-  `2^15−1`、x86-64 4 级页表至多 `2^14−1`；严格 48 位模式另受 `2^16−1` 分配上限约束）时，
-  `--alias 1` 把多个 idx 预填到少量 region，使 `2^20` 表项
-  全部有效且数据工作集固定；alias 仅用于表 cache/overhead 测量，映射正确性由 C1/C2 覆盖；
+  `2^15−1`、x86-64 4 级页表至多 `2^14−1`；严格 48 位模式另受 `2^16−1` 分配上限约束）时：
+  - `--alias 1` 预填把多个 idx 指向一个小 region 池（默认 64 个 region，轮转分配），
+    使 `2^20` 表项全部有效且数据工作集固定；
+  - 对 `invalid_ratio > 0`，慢路径首次创建同样从该池**按引用计数复用** region
+    （"create 仍计数、仍付模拟时延，但不消耗新 region"），否则 100% 无效的 `2^20`
+    表项需要 `2^20` 个 region，必然耗尽 region 号。该模式只用于表 cache/overhead 测量
+    （数据可能别名到同一区域，不参与正确性判定），映射正确性由 C1/C2/C7 在非 alias 模式覆盖；
+  - 不使用 alias 时，框架把触及表项集合的基数限制在 `REGION_COUNT − 1` 以内
+    （所有首触完成后这些表项都要各占一个 region），并在结果中记录实际集合大小；
 - **每次重复前重置表状态**：创建的表项回滚、失效集合重布 —— 保证瞬态行为可复现，
-  每次重复测得相同的"瞬态 + 稳态"混合；
+  每次重复测得相同的"瞬态 + 稳态"混合。alias 表项共享同一 region，重置时按引用计数
+  逐个 `vamap_map_destroy`（最后一个引用才真正回收），或只清表项；**不得**绕过引用计数
+  直接释放共享 region（design.md §6.4）；
 - **持续无效压力**由 T12（churn）承担，其余用例测"初始无效 → 首触创建 → 稳态"全过程。
 
 ### 4.3 时延模式语义
@@ -100,18 +114,24 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 
 最坏组合（随机全空间 × 100% 无效 × 10ms）若触及全部 2^20 表项需 `2^20 × 10ms ≈ 2.9 h`。
 框架按 `--max-creates-per-rep`（默认 4096，即 ≤ 41 s/rep）自动缩小该配置下的
-表项空间 M 并在结果中记录实际 M；预期 creates 同步按解析式修正（§9.3）。
+**触及表项集合大小** M 并在结果中记录实际 M；预期 creates 同步按解析式修正（§9.3）。
+缩小只影响触及集合：pattern 的索引掩码/活动集合同步改为 M（如 T2 的 `& (M−1)`、
+T10 的工作集档位），并在结果中记录；不改变慢路径语义。表 cache miss 特性由
+0%/低比例的全空间配置（T2/T9/T10）保证，`100% × 10ms` 等组合的主指标是慢路径成本
+而非表 cache 行为。`smoke` 档进一步把 `--max-creates-per-rep` 降到 64、reps 降到 2
+（慢组合每重复 < 1 s），使 CI 总时长保持在约 20 分钟。
 
 ## 5. 正确性套件（性能测试门槛）
 
 | ID | 用例 | 通过判据 |
 |----|------|----------|
-| C1 | 转换位精确性：预填 10^7 个随机 VVA（含随机 tag[63:52]），与软件模型逐位比对 | 完全一致；tag 不影响结果 |
+| C1 | 转换位精确性：在非零 arena 基址下预填 10^7 个随机 VVA（含随机 tag[63:52]），与软件模型逐位比对 | 完全一致；tag 不影响结果；VA = arena + region<<32 + offset |
 | C2 | create/destroy 往返：无效→创建→有效→销毁；区域号不复用至销毁 | 状态机正确 |
 | C3 | 同索引竞争创建：N 线程对同一 VVA 并发首触 | 仅 1 次 create、1 个区域号、各线程 VA 一致、数据一致 |
 | C4 | 异索引并发 + 跨线程可见性：A 线程创建映射并写 payload，release 发布 ready；B 线程 acquire 读 ready 后读 payload | 读到发布值；TSAN/Helgrind 无告警 |
 | C5 | churn 压力：8 线程 10^6 次随机 create/destroy + 并发读者校验 payload 签名（遵守 design.md §6.4 的销毁纪律） | 无错误、无死锁 |
 | C6 | 时延精度：4 档时延下实测 spin_ns/creates 与配置偏差 | ≤ ±5% |
+| C7 | alias 共享与销毁：两个 idx alias 同一 region，销毁其中一个后另一个仍有效；最后一个销毁后 region 才可复用 | 引用计数正确、无提前回收 |
 
 ## 6. 性能测试用例
 
@@ -123,16 +143,20 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 - **目的**：测纯快路径成本（readme：重复访问相近 VVA 使映射表 L1 命中）。
 - **序列**：在单个映射内的 W 字节窗口反复读写，W ∈ {64B, 4KiB, 2MiB}；
   `for i: A[i % (W/8)] += c;`
-- **表行为**：1 个表项常驻 L1；窗口 ≤2MiB 时数据行也基本常驻。
-- **预期**：+5–15 cycle/op（§10）。
+- **表行为**：1 个表项常驻 L1；64B/4KiB 窗口的数据行常驻 L1，2MiB 窗口的数据行
+  常驻 L2/LLC（视主机缓存容量，可能下探 DRAM），但表项访问始终是 L1 命中。
+- **预期**：转换增量 +5–15 cycle/op（§10）；2MiB 档的绝对耗时受数据 miss 影响，
+  但该部分在 B0 中同样存在，overhead 仍主要来自转换。
 
 ### T2 随机全空间访问（表项 cache miss）
 
 - **目的**：表项 miss 各级缓存的行为 + 慢路径混合（readme：随机访问 VVA 使映射表 miss）。
 - **序列**：`idx = xorshift64() & (2^20−1); off = rand32();` 读写随机混合（R:W = 2:1）。
-- **表行为**：8 MiB 表对 L2 必 miss，LLC/DRAM 视主机而定；无效比例触发创建。
-  全空间 0% 无效/全表扫描用 `--alias 1` 预填，避免 `2^20` 表项耗尽 region 号并固定
-  数据工作集；数据侧随机访问的 miss 在 B0/B2 中同样存在，overhead 只计转换增量；
+- **表行为**：8 MiB 表超出典型 L2（0.5–2 MiB），通常 L2 必 miss；LLC/DRAM 视主机
+  LLC 容量而定；无效比例触发创建。
+  全空间 0% 无效/全表扫描用 `--alias 1` 预填；`invalid_ratio > 0` 时慢路径创建复用
+  该 alias 池（§4.2），避免 `2^20` 表项耗尽 region 号并固定数据工作集；数据侧随机
+  访问的 miss 在 B0/B2 中同样存在，overhead 只计转换增量；
   数据页在预热阶段按实际访问集合预触，缺页开销单列（§9.2）。
 - **预期**：0% 时 +30–60 cycle/op（表项 LLC 命中）；100% × 10ms 时总时间 ≈
   creates × 10ms + 稳态时间。
@@ -140,10 +164,11 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 ### T3–T6 STREAM 四种访问模式
 
 经典 STREAM 内核的 VVA 版本。默认 **STREAM-M 变体**——把每个数组切成 M 个 16 MiB 分块
-（默认 M = 256，即每数组 M × 16 MiB = 4 GiB；每个分块占一个独立映射索引——多数组内核中
-各数组的第 j 块共用索引 j 的 4 GiB 窗口、以不同 offset 排布，故触及表项数恒为 M），
-按轮转顺序流式扫过，使触及表项数可控、无效率矩阵有意义；`M=1` 时只保留一个热表项，
-作为经典 STREAM 的微变体 T3a–T6a（此时仅 0%/100% 两种无效率有意义，其余比例退化）。
+（默认 M = 256，即每数组 M × 16 MiB = 4 GiB）。每个数组的第 j 块使用映射索引 j；
+多数组内核中各数组的第 j 块共用索引 j 的 4 GiB 窗口，以不同 offset 排布，故触及表项数
+恒为 M。按轮转顺序流式扫过，使触及表项数可控、无效率矩阵有意义；`M=1` 时只保留一个
+热表项，作为经典 STREAM 的微变体 T3a–T6a（此时仅 0%/100% 两种无效率有意义，其余比例
+退化，需按 §4.2 用 4 表项变体覆盖 25% 步进）。
 
 | ID | 内核 | 每迭代访存 | 转换次数 |
 |----|------|------------|----------|
@@ -157,7 +182,8 @@ vamap_bench --matrix --level smoke|standard|full --out results/
   - **v3 首触**：初始 100% 无效，创建成本按首触摊销（与矩阵的 target 模式联动）。
 - **表行为**：M 个热表项（默认 256 条 × 8 B = 2 KB，常驻 L1）；数据侧每数组 M × 16 MiB
   （默认 4 GiB）远超各级缓存、为 DRAM 带宽受限（STREAM 的测量本意），单个 16 MiB 分块
-  也超出 L1/L2，M=1 变体的 16 MiB 工作集可驻留 LLC（视主机 LLC 容量而定）；
+  也超出 L1/L2；M=1 时每数组 16 MiB，T3/T4 总工作集 32 MiB、T5/T6 为 48 MiB，可驻留
+  大型 LLC（视主机 LLC 容量而定），小 LLC 上仍会下探 DRAM；
 - **预期**：0% 无效时带宽下降 5–30%（每访存多 1 次 load 占用 load 端口 + 转换链）。
 
 ### T7 步长访问
@@ -239,7 +265,8 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 
 - **线程布局**：线程绑核（`--pin`），共享映射表与运行时；
 - **索引共享模式**（每 pattern 均测两种）：
-  - `private`：线程私有 VVA 区间（表项不共享，快路径纯读共享，预期近线性扩展）；
+  - `private`：线程私有 VVA 区间（表项集合不重叠；映射表本身共享且快路径只读，
+    预期近线性扩展）；
   - `shared`：线程访问相同表项集合（复现 readme 所述"多线程共享相同表项"，
     快路径无争用、慢路径经条带锁串行化）；
 - **重点组合**：T11（竞争语义）、T12（churn）、T2/T6（扩展性）× threads {1,2,4,8,16}；
@@ -272,8 +299,9 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 | 校验 | 判据 |
 |------|------|
 | 慢路径计数 | `creates_actual == creates_expected`；随机访问解析式：
-  触及数 `D ≈ M(1−(1−1/M)^N)`，`creates_expected = ratio × D`（target 模式按集合精确计算） |
-| 快路径形态 | T1 的 `instr_per_op == B0 + VAMAP_CONV_INSNS`（x86-64 strict 默认 8、fast 7；按构建变体断言） |
+  触及数 `D ≈ M(1−(1−1/M)^N)`，`creates_expected = invalid_ratio_actual × D`
+  （target 模式按集合精确计算；比例取整后以实际值为准） |
+| 快路径形态 | T1 的 `instr_per_op == B0 + VAMAP_CONV_INSNS`（x86-64 strict 默认 8、fast 7；BMI2 `shrx` 变体 7/6；按构建变体断言） |
 | 时延正交性 | B1 在四种时延下 ns_per_op 偏差 ≤ 1% |
 | 重复稳定性 | 中位数 CV ≤ 5%，否则加跑 |
 
@@ -302,7 +330,7 @@ CSV schema（每行一个配置一次运行）：
 
 ```text
 suite,host,date,arch,build,test_id,pattern,variant,mode(B0|B1|B2),threads,idx_mode,alias,
-invalid_ratio,invalid_scope,latency_ns,latency_mode,M,ops,reps,
+invalid_ratio,invalid_ratio_actual,invalid_scope,latency_ns,latency_mode,M,ops,reps,
 creates_expected,creates_actual,destroys,
 ns_per_op_med,ns_per_op_min,ns_per_op_max,cycles_per_op,instr_per_op,
 l1m_per_op,llc_per_op,dtlb_per_op,br_per_op,minor_faults,major_faults,

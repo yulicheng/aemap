@@ -12,8 +12,9 @@
 - `[51:32]` 为映射索引（idx），索引映射表；
 - `[63:52]` 忽略（默认实现显式掩码；fast 变体约定为 0）。
 
-每次 `ld`/`st` 之前进行一次**内联查表**：用 `VVA[51:32]` 查映射表得到真实 VA 的高位
-`VA[48:32]`，与 `VVA[31:0]` 合并成 VA，再用 VA 完成实际访存。查表后判断表项是否有效；
+每次 `ld`/`st` 之前进行一次**内联查表**：用 `VVA[51:32]` 查映射表得到区域真实基址
+（VA 高位字，包含 `VA[48:32]` 区域字段），与 `VVA[31:0]` 合并成 VA，再用 VA 完成实际访存。
+查表后判断表项是否有效；
 无效时走慢路径：调用运行时中的映射创建函数（含可配置建立时延）并**填充表项**。
 映射表被多线程共享，表项的创建与发布必须线程安全。
 
@@ -40,49 +41,59 @@ VVA 空间 = `2^20` 个 4 GiB 区域 = `2^52` 字节。
 
 | 位段 | 宽度 | 含义 |
 |------|------|------|
-| `[63:49]` | 15 | 恒 0 |
-| `[48:32]` | 17 | 区域号 region，来自映射表项（48 位虚地址约定下 bit48 = 0） |
+| `[63:32]` | 32 | 区域基址的 `[63:32]` 位：`(arena + (region << 32)) >> 32`（基址低 32 位恒 0） |
 | `[31:0]`  | 32 | 直接取 `VVA[31:0]` |
+
+`arena` 是 4 GiB 对齐的竞技场基址；`region` 是相对竞技场的区域号。readme 的
+`VA[48:32]`（17 位）是 49 位 VA 描述下的区域字段；本实现把**完整区域基址**写入表项，
+因此同样适用于 LA57 / ARMv8.2-LVA 等更宽的真实 VA。
 
 ### 2.3 映射关系
 
 ```
-VA = (region(idx) << 32) | (VVA & 0xFFFFFFFF)
-region : [0, 2^20) → [0, 2^17)   由运行时动态分配（允许多对一）
-region(idx) == 0 表示该索引尚未建立映射
+VA = (arena + (region(idx) << 32)) | (VVA & 0xFFFFFFFF)
+VA = entry(idx) | (VVA & 0xFFFFFFFF)          entry(idx) = arena + (region(idx) << 32)
+region : 索引 → [1, REGION_COUNT)             由运行时动态分配（region 0 保留，允许多对一）
+entry(idx) == 0 表示该索引尚未建立映射
 ```
 
 - 映射允许多对一：多个 idx 可指向同一 region；区域号按需分配，同时活跃的映射数
-  受 region 号空间限制（17 位字段为 `2^17−1`，严格 48 位模式为 `2^16−1`；
+  受 region 号空间限制（相对 region 号 17 位为 `2^17−1`，严格 48 位模式为 `2^16−1`；
   实际可用数还受平台用户 VA 上限约束，见 §6.2 的 `REGION_COUNT` 回退表）；
 - 表项数 `2^20` 大于可用 region 数，因此“全表有效”只能通过多对一预填（alias）实现；
   正常运行路径仍按需分配/复用 region；
-- **运行时保留 region 0 不分配**，因此"表项整字为 0 ⇔ 无效"成立，有效性判断无需独立 valid 位；
-- 严格 48 位虚地址模式下区域号分配限制在 `[1, 2^16-1]`（即 bit48 恒 0，VA 值域上界
-  256 TiB − 4 GiB；用户态可访问空间随平台而定——ARM64 48 位 VA 为完整 256 TiB，
-  x86-64 4 级页表用户空间仅 128 TiB，见 §6.2）；
-  17 位字段宽度保留，便于将来扩展到 `2^49` 地址空间。两种取法对快路径指令形态没有影响。
+- **运行时保留 region 0 不分配**，且有效表项为 `arena + region<<32`（arena 4 GiB 对齐、
+  region ≥ 1），因此有效表项恒非 0；"表项整字为 0 ⇔ 无效"成立，无需独立 valid 位；
+- 严格 48 位虚地址模式下，相对区域号分配限制在 `[1, 2^16−1]`，并要求
+  `arena + (实际使用的 region 数 + 1)×4 GiB ≤ 2^48`：最高可访问地址上界为 `2^48−1`；
+  因 arena 通常非 0，实际可用 region 数为
+  `min(2^16−1, floor((2^48 − arena)/4 GiB) − 1)`，并非总能取满 `2^16−1`
+  （区域基址上界 `256 TiB − 4 GiB` 仅在 arena=0 时取到）。用户态可访问空间随平台
+  而定——ARM64 48 位 VA 为完整 256 TiB，x86-64 4 级页表用户空间仅 128 TiB，见 §6.2；
+  17 位相对 region 号宽度保留，便于将来扩展到 `2^49` 地址空间。两种取法对快路径
+  指令形态没有影响。
 
 > **规格说明**：readme 原文为"将 VVA 高 51 到 32 位转换成真实的 VA 高 48 到 32 位"。
-> 本设计按字段 `VA[48:32]`（17 位）实现表项与转换；若严格要求真实 VA 为 48 位，
-> 只需将运行时的区域号分配上限设为 `2^16-1`，快路径不变。
+> 本设计用表项存完整区域基址，相对 region 号取 17 位（对应 `VA[48:32]` 的字段宽度）；
+> 若严格要求真实 VA 为 48 位，只需将相对 region 号上限设为 `2^16−1` 并保证
+> `arena + 竞技场 ≤ 2^48`，快路径不变。
 
 ### 2.4 表项编码（核心设计决策）
 
 ```c
 /* 表项：64 位，天然 8 字节对齐，可原子读写 */
-entry = (uint64_t)region << 32;
-/* bit[63:49] = 0；bit[48:32] = region（预移位到 VA 中的位置）；bit[31:0] = 0 */
+entry = (uint64_t)arena + ((uint64_t)region << 32);
+/* bit[31:0] = 0；bit[63:32] = arena 基址区域 + region（即 VA 高位字） */
 /* entry == 0  ⇔  无效；  entry != 0 ⇔ 有效，VA = entry | (uint32_t)vva */
 ```
 
 这样编码的收益直接决定快路径形态：
 
-1. **region 预移位到位**：表项值即 VA 的高位字；与 offset 合并时先把 offset
+1. **完整基址预置到位**：表项值即 VA 的高位字；与 offset 合并时先把 offset
    零扩展，再用一条 OR 合并（x86：`movl %edi, %ecx` + `orq %rcx, %rax`），
-   无需移位或额外掩码；
+   无需移位、额外加法或掩码；
 2. **无独立 valid 位**：有效性判断 = 整字判零（`test rax, rax`），不需要任何掩码；
-3. **低位全 0**：`entry | offset` 精确无损；
+3. **低位全 0**：arena 与 region 基址均 4 GiB 对齐，`entry | offset` 精确无损；
 4. **8 字节对齐**：单条 mov 即原子读写，发布/读取无需复杂协议。
 
 ## 3. 系统总体结构
@@ -119,8 +130,8 @@ design.md  test.md
   避免表自身访问引入额外 dTLB 压力；
 - 表内容只被慢路径写入（release）、被快路径读取（acquire + 地址依赖），无快路径写共享；
 - 大小可调：`VAMAP_IDX_BITS` 编译期可改（默认 20）。8 MiB 意味着单个热表项在 L1 命中、
-  全表随机访问在 L2 必 miss、在典型 LLC（≥8 MiB）内命中——这正是 test.md 中
-  L1 命中 / cache miss 两类场景的硬件基础。
+  全表随机访问通常超出 L2 容量，并在多数 LLC（≥8 MiB）内命中或下探 DRAM——这正是
+  test.md 中 L1 命中 / cache miss 两类场景的硬件基础。
 
 ## 5. 快速路径：查表转换的最优指令实现
 
@@ -164,7 +175,7 @@ orq   %rcx, %rax                ; rax = VA = entry | offset
 
 - **合并必须用“零扩展 + OR”两步**：`movl %edi, %ecx` 把 offset 零扩展到 64 位，
   `orq %rcx, %rax` 再与表项高位合并。不能用 `movl %edi, %eax` 代替——32 位写会
-  同时清零 rax 高 32 位，把表项中的 region 丢掉；
+  同时清零 rax 高 32 位，把表项中的区域基址丢掉；
   寄存器-寄存器 `mov` 在多数微架构上可由重命名阶段消除（move elimination，0 执行端口），
   OR 的关键路径约 1 cycle；
 - **test/je 宏融合**为 1 uop；`(%rdx,%rcx,8)` 使用比例变址，无需额外 lea；
@@ -172,8 +183,12 @@ orq   %rcx, %rax                ; rax = VA = entry | offset
   （`VAMAP_FAST_TAG0`），删除 `andl` 后为 **7 条 / 约 5 uops**；
   构建系统以宏 `VAMAP_CONV_INSNS`（strict 8 / fast 7）把该数值暴露给测试框架，
   供 `instr_per_op` 断言使用（test.md §9.3）；
-- BMI2 的 `shrx`/`bextr` 可把“取索引”压到 1 条，strict 约 6 条；合并的
-  零扩展 + OR 仍不能省。
+- 其中 1 条 `mov` 用于把原 vva 保留给慢路径调用：移位是破坏性操作，而慢路径需要
+  完整 vva、合并 offset 又需要低 32 位。若目标平台支持 BMI2，用非破坏性的
+  `shrx %rcx, %rdi, 32` 取代 `mov+shr` 即可省去该复制，得到 strict 7 / fast 6 的
+  变体；默认基线（无 BMI2）按 8/7 计，测试断言以对应构建变体为准；
+- BMI2 的 `bextr` 可用 1 条指令直接取 `VVA[51:32]`，strict 约 6 条；`shrx` 只省去
+  复制/移位中的一条，strict 仍约 7 条。合并的零扩展 + OR 仍不能省。
 - 若要求 tag 任意取值都不影响结果（readme 的“52 位及以上忽略”），保留 `andl` 作为默认；
   fast 变体必须在分配器或调用约定保证 tag≡0 时使用。
 
@@ -191,7 +206,7 @@ bfi  x10, x0, #0, #32           ; 低 32 位插入 offset，保留表项高位
 
 要点：
 
-- 不能用 `mov w10, w0` 做合并：32 位写会把 x10 高 32 位清零，丢失表项中的 region；
+- 不能用 `mov w10, w0` 做合并：32 位写会把 x10 高 32 位清零，丢失表项中的区域基址；
   必须用 `bfi x10, x0, #0, #32`（或 `mov w11, w0` + `orr x10, x10, x11`）保留高位；
 - `ubfx` 天然只取 `[51:32]`，因此 strict 与 fast 在 ARM64 上同为 5 条
   （acquire 的 `ldar` 与地址计算各 1 条）；若改用 relaxed `ldr`，可省 `add` 并为 4 条，
@@ -201,15 +216,18 @@ bfi  x10, x0, #0, #32           ; 低 32 位插入 offset，保留表项高位
 
 | 方案 | 表项编码 | 合并方式 | 快路径（x86-64） | 评价 |
 |------|----------|----------|------------------|------|
-| **本设计** | `region<<32`，无效 = 0 | 零扩展 + `or` 合并 | mov/shr/and/load/test+je/mov/or = 8 条（~6 uops；fast 去 and 为 7 条） | 1 次表 load，无独立 valid 位 |
-| valid 位放 bit0 | `region<<32 \| 1` | and+or 掩掉 valid 位 | +1 条（共 9 条：合并前需 `and` 清 bit0） | 判断仍可整字判零（valid 表项恒非零），合并多一条掩码 |
-| 存完整 64 位基址 | 全地址 | `and ~0xFFFFFFFF` + or | +1 条（共 9 条） | 表项信息冗余，合并多一条掩码；若限定基址 4 GiB 对齐并改用 `add` 合并则与本设计同价（等价于本设计编码） |
+| **本设计** | `arena + region<<32`（完整基址），无效 = 0 | 零扩展 + `or` 合并 | mov/shr/and/load/test+je/mov/or = 8 条（~6 uops；fast 去 and 为 7 条） | 1 次表 load，无独立 valid 位；要求 arena 4 GiB 对齐 |
+| 只存相对 region | `region<<32` | 先加 arena 基址再 or | +1 条（共 9 条） | 表项少存基址，但快路径多一次 add/lea；arena=0 时与本设计同价 |
+| 完整基址但未对齐 | 任意 64 位基址 | `and ~0xFFFFFFFF` + or | +1 条（共 9 条：合并前需清低 32 位） | 不要求 4 GiB 对齐，但合并多一条掩码；对齐后即退化为本设计（直接 or） |
+| valid 位放 bit0 | `(arena + region<<32) \| 1` | and+or 掩掉 valid 位 | +1 条（共 9 条：合并前需 `and` 清 bit0） | 判断仍可整字判零（valid 表项恒非零），合并多一条掩码 |
 | 通用 C 合并 | 同本设计 | 直接 `e \| (uint32_t)vva`（朴素写法 `(e & ~0xFFFFFFFF) \| (vva & 0xFFFFFFFF)` 多 1 条掩码） | 与本设计同价（编译器生成零扩展 + or） | 可移植回退 |
 | 无检查 fault 版 | 同本设计 | 无 test/je | 6 条（strict；fast 5 条）、无分支 | 依赖 SIGSEGV，慢路径成本高，见 5.7 |
 
 在"必须显式判断有效性、无效时调用运行时函数，且忽略 tag"这一约束下，本形态的
-**1 次表 load + 1 次移位/掩码 + 1 次判零分支 + 1 次零扩展 + 1 次 OR 合并**已接近下限；
-fast 变体（tag≡0）可省去掩码。
+**1 次 vva 复制（慢路径要保留原值）、1 次移位/掩码、1 次表 load、1 次判零分支、
+1 次零扩展、1 次 OR 合并**已接近下限；
+fast 变体（tag≡0）可省去掩码。表项存完整基址而不是相对 region，避免快路径再承担一次
+`arena` 基址加法；代价是 arena 必须 4 GiB 对齐。
 
 ### 5.5 开销模型（供 test.md 校验）
 
@@ -288,9 +306,9 @@ vva_t    vamap_vva_alloc(uint32_t nidx);  /* 分配 n 个连续索引，返回�
 void     vamap_vva_free(vva_t base, uint32_t nidx);
 
 int      vamap_map_create(uint32_t idx);  /* 显式创建（含模拟时延）；已存在则幂等 */
-int      vamap_map_destroy(uint32_t idx); /* 表项置 0 并回收区域号（无模拟时延） */
+int      vamap_map_destroy(uint32_t idx); /* 表项置 0；引用计数归零时回收区域号（无模拟时延） */
 int      vamap_map_alias(uint32_t idx, uint32_t region);
-                                          /* 测试用：把 idx 预填到已有 region，不计时延 */
+                                          /* 测试用：预填到已有 region（引用计数 +1），不计时延 */
 
 void     vamap_set_create_latency_ns(uint64_t ns);
 void    *vamap_pin(uint64_t vva);         /* 返回当前 4GiB 窗口真实基址（供循环提升查表） */
@@ -307,12 +325,16 @@ vamap_stats vamap_get_stats(void);
 
 `vamap_init` 一次性完成：
 
-- `mmap(NULL, (size_t)REGION_COUNT<<32, PROT_READ|PROT_WRITE,
+- `mmap(NULL, ((size_t)REGION_COUNT << 32) + (4ULL << 30), PROT_READ|PROT_WRITE,
   MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)`
   预留 `REGION_COUNT × 4 GiB` **虚拟**空间作为真实 VA 竞技场（`MAP_NORESERVE` 下仅占虚拟地址）。
+  竞技场必须 **4 GiB 对齐**：多预留 4 GiB 后按对齐地址裁剪，或用 `MAP_FIXED_NOREPLACE`
+  在 4 GiB 对齐的空洞处预留；否则表项低 32 位非零，快路径合并需额外掩码。
   满配 `2^17` 个区域 = 512 TiB，要求平台用户 VA 严格大于 512 TiB（x86-64 5 级页表 LA57、
   ARM64 52 位 VA 等）；`REGION_COUNT` 按平台用户 VA 上限自高向低按 2 的幂回退，
-  取首个可成功预留并为进程自身映射留出余量的档位，并在测试元数据中记录实际值：
+  取首个可成功预留并为进程自身映射留出余量的档位，并在测试元数据中记录实际值。
+  下表是**理论最大值**（假设 arena 位于最低可用地址）；实际值还受 arena 基址与进程
+  已有映射影响，可能低于表中值：
 
   | 平台（用户 VA 上限） | 最大 `REGION_COUNT` | 可用 region 数上限 | 竞技场 |
   |----------------------|---------------------|--------------------|--------|
@@ -320,14 +342,22 @@ vamap_stats vamap_get_stats(void);
   | ARM64 48 位 VA（用户 `2^48` = 256 TiB） | `2^15` | `2^15−1` | 128 TiB |
   | x86-64 4 级（用户空间 `2^47` = 128 TiB，canonical） | `2^14` | `2^14−1` | 64 TiB |
 
-  说明：x86-64 4 级页表的用户地址必须为 canonical 形式，region ≥ `2^15` 的 VA（≥ 128 TiB）
-  用户态不可访问；ARM64 48 位 VA 的用户空间恰为 256 TiB，`2^16` 档（256 TiB 竞技场）会占满
-  全部用户地址而失败。故两平台的回退终点分别为 `2^14` 与 `2^15`，而非 `2^16/2^15`。
-  严格 48 位模式的分配上限 `[1, 2^16−1]` 仅在第一档可全容量实现，其余档位的实际可用
-  region 数取 `min(2^16−1, REGION_COUNT−1)`；
+  说明：x86-64 4 级页表用户空间只有 128 TiB，`2^15` 档的 128 TiB 竞技场已占满全部
+  用户地址；ARM64 48 位 VA 的用户空间恰为 256 TiB，`2^16` 档（256 TiB 竞技场）同样
+  占满全部用户地址。故两平台的回退终点分别为 `2^14` 与 `2^15`，而非 `2^16/2^15`。
+  严格 48 位模式还要求 `arena + (实际可用 region 数 + 1)×4 GiB ≤ 2^48`，即
+  `可用 region 数 ≤ floor((2^48 − arena)/4 GiB) − 1`；再叠加 `2^16−1` 的分配上限。
+  因此严格模式的实际可用 region 数为
+  `min(2^16−1, REGION_COUNT−1, floor((2^48 − arena)/4 GiB) − 1)`，仅当 arena 足够低时
+  才可能达到 `2^16−1`；
 - 可用 region 数（上限 `2^17−1`，平台相关，见上表；严格 48 位模式再叠加 `2^16−1` 分配上限）
   恒小于表项数 `2^20`；需要“全表有效”时测试框架用 `vamap_map_alias` 预填到少量 region，
   正常创建在 region 耗尽时返回错误；
+- **bench 专用 region 池**（`alias` 模式）：`vamap_map_alias` 把大量表项预填到固定池
+  （默认 64 个 region，引用计数），后续 `vamap_map_create` 也从该池复用 region，
+  从而支持在 `2^20` 表项上测非零无效比例而不耗尽 region 号；create 仍正常计数并
+  执行时延模拟。该模式只用于性能测量（数据可能别名），映射正确性由非 alias 模式的
+  C1/C2/C7 覆盖（test.md §4.2）；
 - region `r` 的真实基址 = `arena + ((uint64_t)r << 32)`；
 - 分配区域号空闲链（region 0 保留）、初始化条带锁、校准 TSC。
 
@@ -351,7 +381,7 @@ void *vamap_slow_create_fill(uint64_t vva)
         uint32_t region = region_alloc();                        /* 全局互斥取区域号（快） */
         if (region == 0) { unlock(lk); return NULL; }            /* region 号耗尽 */
         spin_until(tsc_deadline(cfg.create_latency_ns));         /* 模拟建立时延 */
-        e = (uint64_t)region << 32;
+        e = (uint64_t)arena + ((uint64_t)region << 32);
         atomic_store_explicit(&table[idx], e, memory_order_release);  /* 原子发布 */
     }
     unlock(lk);
@@ -375,7 +405,7 @@ void *vamap_slow_create_fill(uint64_t vva)
      模拟系统调用/IO 型分配器；墙钟时间包含调度延迟，CPU 占用不计入。
      两种模式的语义差异在 test.md §4.3 说明，默认 SPIN。
 5. **region 号耗尽**：`region_alloc()` 返回 0 时创建失败（返回 `NULL`），不发布表项；
-   benchmark 通过 `vamap_map_alias` 预填或缩小表项空间避免（test.md §4.2/§4.4）。
+   benchmark 通过 `vamap_map_alias` 预填/池复用或缩小表项空间避免（test.md §4.2/§4.4）。
 
 ### 6.4 映射销毁
 
@@ -383,10 +413,17 @@ void *vamap_slow_create_fill(uint64_t vva)
 vamap_map_destroy(idx):
     lock(stripe);  e = table[idx];
     atomic_store_explicit(&table[idx], 0, memory_order_release);
-    if (e) region_free(e >> 32);  unlock(stripe);
+    if (e) {
+        uint32_t r = (uint32_t)((e - (uint64_t)arena) >> 32);
+        if (region_unref(r) == 0) region_free(r);
+    }
+    unlock(stripe);
 ```
 
 - 销毁**不含模拟时延**（readme 只要求建立时延可配）；
+- **alias 共享 region**：多个 idx 可经 `vamap_map_alias` 指向同一 region，因此区域号需
+  维护引用计数；只有最后一个引用销毁时才回收，否则单个 alias 表项销毁会误回收其他
+  idx 仍在使用的区域；
 - **竞态约束**：销毁与该映射的并发使用者之间需外部同步。mock 中区域内存映射在进程
   生命周期内保留，不会 use-after-free；但区域号回收复用后，在途的旧转换结果
   可能指向新映射的内存。测试框架的 churn 场景遵守"阶段边界销毁"或
@@ -394,15 +431,15 @@ vamap_map_destroy(idx):
 
 ### 6.5 区域号分配器
 
-全局互斥锁 + 空闲链；create 的耗时主体是时延模拟，分配器锁不在关键争用点上
-（不同索引的创建只在取号瞬间串行，随后并行忙等）。
+全局互斥锁 + 空闲链 + 每 region 引用计数（alias 共享用）；create 的耗时主体是时延模拟，
+分配器锁不在关键争用点上（不同索引的创建只在取号瞬间串行，随后并行忙等）。
 
 ## 7. 线程安全设计
 
 | 共享对象 | 快路径 | 慢路径 | 保障机制 |
 |----------|--------|--------|----------|
 | 表项 `table[idx]` | 无锁读 | 互斥写 | acquire load + **地址依赖**；release store 发布 |
-| 区域号空闲链 | 不触及 | 全局互斥 | 互斥锁（不在时延等待内） |
+| 区域号空闲链 / 引用计数 | 不触及 | 全局互斥 | 互斥锁（不在时延等待内） |
 | 条带锁数组 | 不触及 | 取锁 | 每条目 64B padding，避免伪共享 |
 | 区域内存 | 经 VA 访问 | create 前写或应用同步 | release/acquire 顺序 |
 
@@ -444,7 +481,8 @@ test.md §5 定义，性能测试前必须全部通过作为门槛。
 ## 10. 已知限制与扩展方向
 
 - 表项编码假定区域基址 4 GiB 对齐（offset 32 位），不支持任意对齐的对象放置；
-- destroy 竞态通过使用纪律约束，未实现引用计数/epoch 回收（扩展项）；
+- destroy 与在途使用的竞态通过使用纪律（阶段边界销毁/线程私有索引）约束，
+  未实现 epoch/hazard-pointer 回收；region 引用计数仅用于 alias 共享（扩展项：epoch 回收）；
 - 未做两级表（8 MiB 单表对 LLC 友好；若缩小索引位宽可重审）；
 - fault 版（§5.7）与 per-core 表、批量预转换、编译器 hoisting 属后续优化空间，
   均以 test.md T15 的方式量化对比。
