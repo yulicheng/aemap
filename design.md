@@ -1,0 +1,429 @@
+# design.md — VVA→VA 动态地址映射设计与实现
+
+> 本文档描述 readme.md 项目目标的实现方式：地址格式与映射模型、映射表与表项编码、
+> 最优的查表转换指令、mock 运行时库（映射创建/销毁/建立时延模拟）、线程安全设计与应用集成方式。
+> 测试框架与测试用例在 [test.md](test.md) 中详细描述。
+
+## 1. 概述
+
+应用代码使用 52 位的"虚虚地址" **VVA**（Virtual Virtual Address）作为指针：
+
+- 低 32 位 `[31:0]` 为区域内偏移（offset）；
+- `[51:32]` 为映射索引（idx），索引映射表；
+- `[63:52]` 忽略（默认实现显式掩码；fast 变体约定为 0）。
+
+每次 `ld`/`st` 之前进行一次**内联查表**：用 `VVA[51:32]` 查映射表得到真实 VA 的高位
+`VA[48:32]`，与 `VVA[31:0]` 合并成 VA，再用 VA 完成实际访存。查表后判断表项是否有效；
+无效时走慢路径：调用运行时中的映射创建函数（含可配置建立时延）并**填充表项**。
+映射表被多线程共享，表项的创建与发布必须线程安全。
+
+设计目标：
+
+1. **快路径指令数最少**：每次 ld/st 仅新增一次表项 load 与少量 ALU/分支指令；
+2. **慢路径语义清晰**：同索引创建串行化、结果原子发布、建立时延可配置为 10us/100us/1ms/10ms；
+3. **线程安全**：快路径无锁读，慢路径互斥 + release 发布；
+4. **可度量**：转换开销能被 test.md 的框架精确测量并分解为快路径/慢路径两部分。
+
+## 2. 地址格式与映射模型
+
+### 2.1 VVA（应用指针）布局
+
+| 位段 | 宽度 | 含义 |
+|------|------|------|
+| `[63:52]` | 12 | 未使用/忽略（tag）：转换结果不得依赖这些位；默认实现显式掩码，fast 变体约定为 0 |
+| `[51:32]` | 20 | 映射索引 idx，映射表下标，共 `2^20 = 1M` 个表项 |
+| `[31:0]`  | 32 | 区域内偏移 offset（区域粒度 4 GiB） |
+
+VVA 空间 = `2^20` 个 4 GiB 区域 = `2^52` 字节。
+
+### 2.2 VA（真实虚地址）布局
+
+| 位段 | 宽度 | 含义 |
+|------|------|------|
+| `[63:49]` | 15 | 恒 0 |
+| `[48:32]` | 17 | 区域号 region，来自映射表项（48 位虚地址约定下 bit48 = 0） |
+| `[31:0]`  | 32 | 直接取 `VVA[31:0]` |
+
+### 2.3 映射关系
+
+```
+VA = (region(idx) << 32) | (VVA & 0xFFFFFFFF)
+region : [0, 2^20) → [0, 2^17)   由运行时动态分配（允许多对一）
+region(idx) == 0 表示该索引尚未建立映射
+```
+
+- 映射允许多对一：多个 idx 可指向同一 region；区域号按需分配，同时活跃的映射数
+  受 region 号空间限制（17 位字段为 `2^17−1`，严格 48 位模式为 `2^16−1`）；
+- 表项数 `2^20` 大于可用 region 数，因此“全表有效”只能通过多对一预填（alias）实现；
+  正常运行路径仍按需分配/复用 region；
+- **运行时保留 region 0 不分配**，因此"表项整字为 0 ⇔ 无效"成立，有效性判断无需独立 valid 位；
+- 严格 48 位虚地址模式下区域号分配限制在 `[1, 2^16-1]`（即 bit48 恒 0，可用空间 256 TiB − 4 GiB）；
+  17 位字段宽度保留，便于将来扩展到 `2^49` 地址空间。两种取法对快路径指令形态没有影响。
+
+> **规格说明**：readme 原文为"将 VVA 高 51 到 32 位转换成真实的 VA 高 48 到 32 位"。
+> 本设计按字段 `VA[48:32]`（17 位）实现表项与转换；若严格要求真实 VA 为 48 位，
+> 只需将运行时的区域号分配上限设为 `2^16-1`，快路径不变。
+
+### 2.4 表项编码（核心设计决策）
+
+```c
+/* 表项：64 位，天然 8 字节对齐，可原子读写 */
+entry = (uint64_t)region << 32;
+/* bit[63:49] = 0；bit[48:32] = region（预移位到 VA 中的位置）；bit[31:0] = 0 */
+/* entry == 0  ⇔  无效；  entry != 0 ⇔ 有效，VA = entry | (uint32_t)vva */
+```
+
+这样编码的收益直接决定快路径形态：
+
+1. **region 预移位到位**：表项值即 VA 的高位字；与 offset 合并时先把 offset
+   零扩展，再用一条 OR 合并（x86：`movl %edi, %ecx` + `orq %rcx, %rax`），
+   无需移位或额外掩码；
+2. **无独立 valid 位**：有效性判断 = 整字判零（`test rax, rax`），不需要任何掩码；
+3. **低位全 0**：`entry | offset` 精确无损；
+4. **8 字节对齐**：单条 mov 即原子读写，发布/读取无需复杂协议。
+
+## 3. 系统总体结构
+
+```
+应用代码（VVA 指针）
+    │  VLOAD / VSTORE 宏（每次访存前内联转换）
+    ▼
+快速路径 vva2va()  ──entry==0──▶  慢路径 vamap_slow_create_fill()
+    │ 查映射表(8 MiB)                  │ 条带锁 + double-check
+    ▼                                  ▼
+实际 ld/st（VA）                 mock 运行时：区域分配 + 建立时延模拟
+                                       │ release 发布表项
+                                       ▼
+                                  映射表（多线程共享）
+```
+
+目录结构：
+
+```
+include/vamap.h            # 公共 API、表项编码、内联转换、平台选择
+src/vamap_runtime.c        # 运行时：init/创建/销毁/时延模拟/区域与锁管理
+src/vamap_arch.c           # （可选）手写汇编快路径
+bench/                     # 测试框架（见 test.md）：harness / patterns / timer / perf
+tests/                     # 正确性套件（见 test.md §5）
+scripts/check_fastpath.sh  # objdump 校验快路径指令形态
+design.md  test.md
+```
+
+## 4. 映射表设计
+
+- 定义：`alignas(64) uint64_t vamap_table[1u << 20];`，共 **8 MiB**；
+- `init` 时匿名 `mmap` 分配，并建议以 2 MiB 大页对齐/驻留（`MAP_HUGETLB` 或 `madvise(MADV_HUGEPAGE)`），
+  避免表自身访问引入额外 dTLB 压力；
+- 表内容只被慢路径写入（release）、被快路径读取（acquire + 地址依赖），无快路径写共享；
+- 大小可调：`VAMAP_IDX_BITS` 编译期可改（默认 20）。8 MiB 意味着单个热表项在 L1 命中、
+  全表随机访问在 L2 必 miss、在典型 LLC（≥8 MiB）内命中——这正是 test.md 中
+  L1 命中 / cache miss 两类场景的硬件基础。
+
+## 5. 快速路径：查表转换的最优指令实现
+
+### 5.1 C 参考实现（默认，可移植）
+
+```c
+extern uint64_t vamap_table[1u << 20];        /* 8 MiB 映射表 */
+void *vamap_slow_create_fill(uint64_t vva);   /* 慢路径：创建并填充表项，返回 VA */
+
+static inline __attribute__((always_inline, hot))
+void *vva2va(uint64_t vva)
+{
+    /* 默认 strict：显式掩掉 bit[63:52] 的 tag，满足 readme 的“52 位及以上忽略” */
+    uint32_t idx = (uint32_t)(vva >> 32) & 0xFFFFFu;
+    uint64_t e = __atomic_load_n(&vamap_table[idx], __ATOMIC_ACQUIRE);
+    if (__builtin_expect(e == 0, 0))
+        return vamap_slow_create_fill(vva);   /* 无效：调用运行时创建函数并填充表项 */
+    return (void *)(e | (uint32_t)vva);       /* 合并：VA 高位 | 零扩展 offset */
+}
+```
+
+`-O2` 下编译器通常直接生成 5.2 节的 strict 目标序列（x86-64），用 `scripts/check_fastpath.sh`
+（objdump 抽查）验证。
+
+### 5.2 x86-64 目标序列
+
+```asm
+; 输入：rdi = vva，rdx = &vamap_table[0]（循环内基址驻留寄存器）
+movq  %rdi, %rcx
+shrq  $32, %rcx                 ; rcx = vva[63:32]
+andl  $0xFFFFF, %ecx            ; idx = vva[51:32]，忽略 tag（strict 默认）
+movq  (%rdx,%rcx,8), %rax       ; rax = entry（唯一一次表 load）
+testq %rax, %rax
+je    .Lslow                    ; entry == 0 → 调 vamap_slow_create_fill
+movl  %edi, %ecx                ; ecx = 零扩展后的 offset
+orq   %rcx, %rax                ; rax = VA = entry | offset
+; 此后以 (%rax) 执行实际 ld/st
+```
+
+要点：
+
+- **合并必须用“零扩展 + OR”两步**：`movl %edi, %ecx` 把 offset 零扩展到 64 位，
+  `orq %rcx, %rax` 再与表项高位合并。不能用 `movl %edi, %eax` 代替——32 位写会
+  同时清零 rax 高 32 位，把表项中的 region 丢掉；
+  寄存器-寄存器 `mov` 在多数微架构上可由重命名阶段消除（move elimination，0 执行端口），
+  OR 的关键路径约 1 cycle；
+- **test/je 宏融合**为 1 uop；`(%rdx,%rcx,8)` 使用比例变址，无需额外 lea；
+- 指令数：**strict 8 条 / 约 6 uops（循环内）**；若构建约定 tag≡0
+  （`VAMAP_FAST_TAG0`），删除 `andl` 后为 **7 条 / 约 5 uops**；
+- BMI2 的 `shrx`/`bextr` 可把“取索引”压到 1 条，strict 约 6 条；合并的
+  零扩展 + OR 仍不能省。
+- 若要求 tag 任意取值都不影响结果（readme 的“52 位及以上忽略”），保留 `andl` 作为默认；
+  fast 变体必须在分配器或调用约定保证 tag≡0 时使用。
+
+### 5.3 ARM64 目标序列
+
+```asm
+; x0 = vva，x19 = &vamap_table[0]
+ubfx x9,  x0, #32, #20          ; idx = VVA[51:32]，天然忽略 tag
+add  x10, x19, x9, lsl #3       ; LDAR 不支持比例变址，先算地址
+ldar x10, [x10]                 ; acquire load（C11 语义）
+cbz  x10, .Lslow
+bfi  x10, x0, #0, #32           ; 低 32 位插入 offset，保留表项高位
+; 以 [x10] 执行 ld/st
+```
+
+要点：
+
+- 不能用 `mov w10, w0` 做合并：32 位写会把 x10 高 32 位清零，丢失表项中的 region；
+  必须用 `bfi x10, x0, #0, #32`（或 `mov w11, w0` + `orr x10, x10, x11`）保留高位；
+- `ubfx` 天然只取 `[51:32]`，因此 strict 与 fast 在 ARM64 上同为 5 条
+  （acquire 的 `ldar` 与地址计算各 1 条）；若改用 relaxed `ldr`，可省 `add` 并为 4 条，
+  但会失去 C11 acquire 语义。
+
+### 5.4 与替代方案的对比（为什么这是最优形态）
+
+| 方案 | 表项编码 | 合并方式 | 快路径（x86-64） | 评价 |
+|------|----------|----------|------------------|------|
+| **本设计** | `region<<32`，无效 = 0 | 零扩展 + `or` 合并 | mov/shr/and/load/test+je/mov/or = 8 条（~6 uops；fast 去 and 为 7 条） | 1 次表 load，无独立 valid 位 |
+| valid 位放 bit0 | `region<<32 \| 1` | and+or 掩掉 valid 位 | +2 条 | 判断与合并都要掩码 |
+| 存完整 64 位基址 | 全地址 | `and ~0xFFFFFFFF` + or | +2 条 | 表项信息冗余，合并更贵 |
+| 通用 C 合并 | 同本设计 | `(e & ~0xFFFFFFFF) \| (vva & 0xFFFFFFFF)` | 编译器可优化至同本设计 | 可移植回退 |
+| 无检查 fault 版 | 同本设计 | 无 test/je | 6 条（strict；fast 5 条）、无分支 | 依赖 SIGSEGV，慢路径成本高，见 5.7 |
+
+在"必须显式判断有效性、无效时调用运行时函数，且忽略 tag"这一约束下，本形态的
+**1 次表 load + 1 次移位/掩码 + 1 次判零分支 + 1 次零扩展 + 1 次 OR 合并**已接近下限；
+fast 变体（tag≡0）可省去掩码。
+
+### 5.5 开销模型（供 test.md 校验）
+
+- 关键路径：`vva →[shr/and 1–2c]→ 表 load（L1 4–5c；L2 约 +14c；LLC 约 +40c；DRAM 约 +100–200c）
+  →[零扩展/OR 1c]→ 实际 ld/st（L1 4–5c）`；
+- 表项 L1 命中时，每次访存新增**串行延迟 ≈ 7–8 cycle（strict；fast 6–7）**，分支方向高度可预测；
+- 吞吐层面：每次访存多 1 次 load（占用 load 端口）+ 5 条 ALU（其中两条寄存器 mov 可被重命名消除）→ 对带宽受限的
+  STREAM 类内核也会产生可测的吞吐下降，这正是测试要量化的部分；
+- 多个独立访存的转换链之间相互独立，乱序执行可跨迭代重叠，摊销部分开销
+  （指针追逐类内核无此摊销，转换延迟完整暴露）。
+
+### 5.6 融合访存的汇编宏（示例：32 位 load）
+
+基准内核中使用"转换 + 实际访存"一体化汇编宏，避免内联函数与 ABI 摩擦：
+
+```c
+static inline int32_t vload32(uint64_t vva, const uint64_t *tbl)
+{
+    int32_t v;
+    __asm__ volatile(
+        "movq  %1, %%rcx             \n\t"
+        "shrq  $32, %%rcx            \n\t"
+        "andl  $0xFFFFF, %%ecx       \n\t"   /* idx，忽略 tag */
+        "movq  (%2,%%rcx,8), %%rax   \n\t"
+        "testq %%rax, %%rax          \n\t"
+        "je    1f                    \n\t"
+        "movl  %k1, %%ecx            \n\t"   /* ecx = 零扩展 offset */
+        "orq   %%rcx, %%rax          \n\t"   /* rax = VA */
+        "movl  (%%rax), %k0          \n\t"   /* 实际 load */
+        "jmp   2f                    \n\t"
+        "1: movq %1, %%rdi           \n\t"
+        "call  vamap_slow_create_fill\n\t"   /* rdi = vva 入参；返回 rax = VA */
+        "movl  (%%rax), %k0          \n\t"
+        "2:"
+        : "=&r"(v)
+        : "r"(vva), "r"(tbl)
+        : "rax", "rcx", "rdx", "rsi", "rdi",
+          "r8", "r9", "r10", "r11", "cc", "memory");
+    return v;
+}
+```
+
+> 慢路径 `call` 会破坏 ABI 规定的 caller-saved 寄存器；上表已列出通用寄存器，
+> 若内核中同时有活跃的浮点/向量寄存器，还需按 ABI 追加 `xmm0–xmm15`（或直接使用
+> C 版 `vload32`）。合并同样必须“零扩展 + OR”，不能只写 `%eax`。
+
+ARM64 版本同构（`ubfx/add/ldar/cbz/bfi` + `bl vamap_slow_create_fill`）。
+
+### 5.7 变体：无检查 fault 版（备选，非默认）
+
+表项无效时转换结果落在低 4 GiB（entry 0 与 offset 合并），该区域通常未映射，访存触发 SIGSEGV；
+在信号处理器中调用创建函数后重执行指令。快路径减为 6 条（strict；fast 5 条）且无分支，
+但慢路径成本变为一次信号往返（µs 级），且难以区分空指针 bug。
+仅作为对照组实现（`VAMAP_MODE_FAULT`），不作为默认。
+
+## 6. Mock 运行时库
+
+### 6.1 公共 API
+
+```c
+typedef uint64_t vva_t;            /* 52 位 VVA；默认实现忽略 bit[63:52] */
+
+typedef struct {
+    uint64_t create_latency_ns;   /* 映射建立时延；测试取 10us/100us/1ms/10ms */
+    int      latency_mode;        /* VAMAP_LATENCY_SPIN(默认) / VAMAP_LATENCY_SLEEP */
+    uint32_t lock_stripes;        /* 慢路径锁条带数，默认 4096（2 的幂） */
+    int      strict_48bit;        /* 区域号限制在 [1, 2^16-1] */
+} vamap_cfg;
+
+int      vamap_init(const vamap_cfg *cfg);
+void     vamap_shutdown(void);
+
+vva_t    vamap_vva_alloc(uint32_t nidx);  /* 分配 n 个连续索引，返回基址 VVA（idx<<32） */
+void     vamap_vva_free(vva_t base, uint32_t nidx);
+
+int      vamap_map_create(uint32_t idx);  /* 显式创建（含模拟时延）；已存在则幂等 */
+int      vamap_map_destroy(uint32_t idx); /* 表项置 0 并回收区域号（无模拟时延） */
+int      vamap_map_alias(uint32_t idx, uint32_t region);
+                                          /* 测试用：把 idx 预填到已有 region，不计时延 */
+
+void     vamap_set_create_latency_ns(uint64_t ns);
+void    *vamap_pin(uint64_t vva);         /* 返回当前 4GiB 窗口真实基址（供循环提升查表） */
+
+typedef struct {
+    uint64_t creates, destroys;           /* 慢路径事件计数（校验用） */
+    uint64_t spin_ns;                     /* 累计模拟时延 */
+    uint64_t fast_hits, slow_calls;
+} vamap_stats;
+vamap_stats vamap_get_stats(void);
+```
+
+### 6.2 地址空间预留
+
+`vamap_init` 一次性完成：
+
+- `mmap(NULL, (size_t)REGION_COUNT<<32, PROT_READ|PROT_WRITE,
+  MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)`
+  预留 `2^17 × 4 GiB = 512 TiB` **虚拟**空间作为真实 VA 竞技场（`MAP_NORESERVE` 下仅占虚拟地址）；
+  若平台用户 VA 上限不足（x86-64 4 级页表约 128 TiB），按 2 的幂回退到 `2^16/2^15`
+  个区域，并在测试元数据中记录实际 `REGION_COUNT`；严格 48 位模式使用 `2^16` 个区域（256 TiB）；
+- 可用 region 数（`2^17−1`，严格 48 位 `2^16−1`）小于表项数 `2^20`；需要“全表有效”时
+  测试框架用 `vamap_map_alias` 预填到少量 region，正常创建在 region 耗尽时返回错误；
+- region `r` 的真实基址 = `arena + ((uint64_t)r << 32)`；
+- 分配区域号空闲链（region 0 保留）、初始化条带锁、校准 TSC。
+
+由此**创建路径不含任何系统调用**：create = 取区域号 + 忙等模拟时延 + 原子发布，
+时延模拟干净、可测。物理页在首次写时由内核按需提交；基准在预热阶段预先触碰
+将要访问的有效 offset，避免把缺页开销混入快路径测量。初始无效表项在创建后的首次
+数据访问仍可能触发缺页，测试框架将其单列（test.md §9.2），不与配置的
+`create_latency_ns` 混淆。
+
+### 6.3 慢路径：映射创建与表项填充
+
+```c
+void *vamap_slow_create_fill(uint64_t vva)
+{
+    uint32_t idx = (uint32_t)(vva >> 32) & 0xFFFFFu;
+    lock_t  *lk  = &locks[idx & (cfg.lock_stripes - 1)];
+
+    lock(lk);                                                    /* 条带自旋锁 */
+    uint64_t e = atomic_load_explicit(&table[idx], memory_order_acquire);
+    if (e == 0) {                                                /* double-check：持锁复查 */
+        uint32_t region = region_alloc();                        /* 全局互斥取区域号（快） */
+        if (region == 0) { unlock(lk); return NULL; }            /* region 号耗尽 */
+        spin_until(tsc_deadline(cfg.create_latency_ns));         /* 模拟建立时延 */
+        e = (uint64_t)region << 32;
+        atomic_store_explicit(&table[idx], e, memory_order_release);  /* 原子发布 */
+    }
+    unlock(lk);
+    return (void *)(e | (uint32_t)vva);
+}
+```
+
+要点：
+
+1. **double-check**：持锁后复查表项，保证同索引并发时只创建一次、只分配一个区域号；
+2. **发布原子且有序**：release store 单条原子写完成"填充表项"；若调用者在调用创建前
+   写入了区域初始化数据，release/acquire 保证这些写对后续读者可见。创建函数本身
+   不初始化 4 GiB 区域，创建后的普通数据写仍需应用同步；
+3. **同索引并发语义**：其余线程在条带锁上排队，持锁者填完后它们复查命中、直接返回
+   ——与真实缺页处理"一个线程填页、其余等待"的串行化语义一致；
+4. **时延模拟两种模式**：
+   - `VAMAP_LATENCY_SPIN`（默认）：`init` 时用 `CLOCK_MONOTONIC` 标定 TSC 频率，
+     `spin_until` 用 `rdtsc + pause` 忙等到 deadline。占核、CPU 开销确定性强，
+     适合测量"分配代价直接计入线程时间"的场景；
+   - `VAMAP_LATENCY_SLEEP`：`clock_nanosleep(绝对 deadline)`，让出核心，
+     模拟系统调用/IO 型分配器；墙钟时间包含调度延迟，CPU 占用不计入。
+     两种模式的语义差异在 test.md §4.3 说明，默认 SPIN。
+5. **region 号耗尽**：`region_alloc()` 返回 0 时创建失败（返回 `NULL`），不发布表项；
+   benchmark 通过 `vamap_map_alias` 预填或缩小表项空间避免（test.md §4.2）。
+
+### 6.4 映射销毁
+
+```c
+vamap_map_destroy(idx):
+    lock(stripe);  e = table[idx];
+    atomic_store_explicit(&table[idx], 0, memory_order_release);
+    if (e) region_free(e >> 32);  unlock(stripe);
+```
+
+- 销毁**不含模拟时延**（readme 只要求建立时延可配）；
+- **竞态约束**：销毁与该映射的并发使用者之间需外部同步。mock 中区域内存映射在进程
+  生命周期内保留，不会 use-after-free；但区域号回收复用后，在途的旧转换结果
+  可能指向新映射的内存。测试框架的 churn 场景遵守"阶段边界销毁"或
+  "线程私有索引"纪律（test.md T12），真实系统可扩展引用计数/epoch 回收。
+
+### 6.5 区域号分配器
+
+全局互斥锁 + 空闲链；create 的耗时主体是时延模拟，分配器锁不在关键争用点上
+（不同索引的创建只在取号瞬间串行，随后并行忙等）。
+
+## 7. 线程安全设计
+
+| 共享对象 | 快路径 | 慢路径 | 保障机制 |
+|----------|--------|--------|----------|
+| 表项 `table[idx]` | 无锁读 | 互斥写 | acquire load + **地址依赖**；release store 发布 |
+| 区域号空闲链 | 不触及 | 全局互斥 | 互斥锁（不在时延等待内） |
+| 条带锁数组 | 不触及 | 取锁 | 每条目 64B padding，避免伪共享 |
+| 区域内存 | 经 VA 访问 | create 前写或应用同步 | release/acquire 顺序 |
+
+内存序论证：
+
+- 快路径使用 `atomic_load(..., ACQUIRE)`：与发布端 release store 形成 C11
+  synchronizes-with，保证表项可见时其先行写入的数据也可见；x86-64 上 acquire load
+  就是普通 `mov`，无额外指令；ARM64 上为 `ldar`（LDAR 不支持比例变址，需额外一条
+  `add` 计算地址）；
+- 表项值作为最终访存的基址，形成硬件级地址/数据依赖，进一步阻止后续数据访问早于
+  表项 load 完成；仅依赖 relaxed + 地址依赖在 x86/ARM64 上通常可行，但不满足 C11 的
+  happens-before，不能作为可移植实现；
+- 发布端 release store 保证"先行数据写入 → 表项可见"的全局顺序；
+- 上述语义在正确性套件中以 TSAN 验证（test.md C4/C5）。
+
+## 8. 应用侧集成
+
+```c
+/* 每次访存前的内联转换宏 */
+#define VLOAD(type, p)     (*(type *)(uintptr_t)vva2va((uint64_t)(uintptr_t)(p)))
+#define VSTORE(type, p, x) (*(type *)(uintptr_t)vva2va((uint64_t)(uintptr_t)(p)) = (x))
+
+/* STREAM Triad 示例 */
+VSTORE(double, A + i, VLOAD(double, B + i) + q * VLOAD(double, C + i));
+```
+
+- **对 VVA 的指针算术无需转换**：idx/offset 分段使 `base + i*8` 在 4 GiB 内自然成立；
+  跨越 4 GiB 边界时索引 +1，前提是目标索引已建立映射（`vamap_vva_alloc(n)` 支持一次
+  分配连续 n 个索引供巨数组使用）；
+- `vamap_pin(vva)` 供流式循环手动提升查表（转换成本上界对照，见 test.md T15）；
+- 编译建议：`-O2 -fno-semantic-interposition`；平台宏选择 x86-64 / ARM64 / 通用 C 回退；
+- 快路径形态校验：`scripts/check_fastpath.sh` 反汇编抽查生成的指令序列是否与 §5.2 一致。
+
+## 9. 正确性保障
+
+正确性套件（转换位精确性、创建/销毁往返、同索引竞争、TSAN 并发、时延精度）在
+test.md §5 定义，性能测试前必须全部通过作为门槛。
+
+## 10. 已知限制与扩展方向
+
+- 表项编码假定区域基址 4 GiB 对齐（offset 32 位），不支持任意对齐的对象放置；
+- destroy 竞态通过使用纪律约束，未实现引用计数/epoch 回收（扩展项）；
+- 未做两级表（8 MiB 单表对 LLC 友好；若缩小索引位宽可重审）；
+- fault 版（§5.7）与 per-core 表、批量预转换、编译器 hoisting 属后续优化空间，
+  均以 test.md T15 的方式量化对比。
