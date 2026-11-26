@@ -78,8 +78,8 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 
 - **初始状态**：先用 `vamap_map_alias`（不计时延）按 pattern 把其触及的表项预填为有效，
   再按 `invalid_scope` 置无效；`invalid_ratio` 是"初始无效表项占触及集合的比例"。
-  预填走 alias 而非 `vamap_map_create`，避免重置阶段就付出 T × create_latency：
-  - `rand`：从已建立表项中随机选 `⌊ratio × 已建立数⌋` 个置无效（`entry=0`）；若用
+  预填走 alias 而非 `vamap_map_create`，避免重置阶段就付出 触及表项数 × create_latency：
+  - `rand`：从已建立表项中随机选 `round(ratio × 已建立数)` 个置无效（`entry=0`）；若用
     `--alias 1` 全表预填，则等价于从 `2^20` 个表项中随机选。对随机访问类 pattern，
     预期 creates = invalid_ratio_actual × 实际触及的不同表项数；
   - `target`：只在 pattern 将触及的表项集合中选 ratio 比例的成员置无效（首触类场景可控）；

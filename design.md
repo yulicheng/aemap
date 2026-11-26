@@ -185,8 +185,10 @@ orq   %rcx, %rax                ; rax = VA = entry | offset
   供 `instr_per_op` 断言使用（test.md §9.3）；
 - 其中 1 条 `mov` 用于把原 vva 保留给慢路径调用：移位是破坏性操作，而慢路径需要
   完整 vva、合并 offset 又需要低 32 位。若目标平台支持 BMI2，用非破坏性的
-  `shrx %rcx, %rdi, 32` 取代 `mov+shr` 即可省去该复制，得到 strict 7 / fast 6 的
-  变体；默认基线（无 BMI2）按 8/7 计，测试断言以对应构建变体为准；
+  `shrx` 取代 `mov+shr` 即可省去该复制，得到 strict 7 / fast 6 的变体
+  （SHRX 无立即数形式，移位量须取自寄存器：循环外预置 `movl $32, %r8d`，
+  循环内 `shrx %r8, %rdi, %rcx` 即 rcx = vva>>32、rdi 原样保留）；
+  默认基线（无 BMI2）按 8/7 计，测试断言以对应构建变体为准；
 - BMI2 的 `bextr` 可用 1 条指令直接取 `VVA[51:32]`，strict 约 6 条；`shrx` 只省去
   复制/移位中的一条，strict 仍约 7 条。合并的零扩展 + OR 仍不能省。
 - 若要求 tag 任意取值都不影响结果（readme 的“52 位及以上忽略”），保留 `andl` 作为默认；
@@ -475,8 +477,8 @@ VSTORE(double, A + i, VLOAD(double, B + i) + q * VLOAD(double, C + i));
 
 ## 9. 正确性保障
 
-正确性套件（转换位精确性、创建/销毁往返、同索引竞争、TSAN 并发、时延精度）在
-test.md §5 定义，性能测试前必须全部通过作为门槛。
+正确性套件（转换位精确性、创建/销毁往返、同索引竞争、TSAN 并发、时延精度、
+churn 压力、alias 引用计数）在 test.md §5 定义，性能测试前必须全部通过作为门槛。
 
 ## 10. 已知限制与扩展方向
 
