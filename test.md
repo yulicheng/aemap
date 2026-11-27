@@ -97,7 +97,7 @@ vamap_bench --matrix --level smoke|standard|full --out results/
   （故不计入 `creates`），也不付出预填条数 × create_latency 的时延：
   - `rand`：从该 pattern 的候选索引空间（`--alias 0` 时为 M 个可触达表项；`--alias 1`
     全表形态为全部 `2^20` 个表项）中随机选 `(1 − ratio)` 比例预填为有效，其余保持未映射
-    （与"先全建再随机置无效"等价，但不产生孤儿 region）。实际触及子集内的无效比例由
+    （初始有效性分布与"先全建再随机置无效"相同，但不产生孤儿 region）。实际触及子集内的无效比例由
     `invalid_ratio_actual` 记录；对随机访问类 pattern，预期
     creates = invalid_ratio_actual × 实际触及的不同表项数；
   - `target`：只在 pattern 将触及的表项集合中按确定规则选 `round(ratio × |T|)` 个成员
@@ -327,8 +327,9 @@ T12 的连续 churn：通过缩小集合或测量窗口控制每重复 create �
 - **序列**：barrier 后所有线程同时首触：
   - **shared**：同一无效索引（表项锁串行化）——SPIN 模式下预期墙钟 ≈ latency × 1 +
     (P−1)×锁交接（SLEEP 见 §4.3），creates = 1（目标初始无效时；0% 对照为 0，见 §4.1）。
-    中间比例按 §4.2 用 4 表项变体时，所有线程仍指向同一个初始无效表项，故 creates 不随
-    ratio 变化；ratio 只改变该 4 表项集合的初始无效数；
+    中间比例按 §4.2 用 4 表项变体时，各线程并发触及同一 4 表项集合：每个初始无效
+    表项恰被创建 1 次（同索引在条带锁上串行化，落入不同条带的表项可并行创建），
+    故 creates = round(ratio × 4)，与 §9.3"每个目标索引 1 次"的口径一致；
   - **disjoint**：各线程私有无效索引集（跨条带并行）——预期近线性扩展，
     creates = P × 各线程私有集合中的初始无效数（0% 对照为 0）。
 - **线程**：P ∈ {2, 4, 8, 16}；时延取全矩阵。disjoint 模式下所有线程的集合总规模按
@@ -417,7 +418,7 @@ T12 的连续 churn：通过缩小集合或测量窗口控制每重复 create �
 
 | 校验 | 判据 |
 |------|------|
-| 慢路径计数 | `creates_actual == creates_expected`；均匀随机访问解析式：触及数 `D ≈ M(1−(1−1/M)^N)`，其中 M 为该用例实际的可触及表项空间（T2 为索引掩码范围、T3–T6 为分块数、T10 为工作集 W、T1 的单表项形态为 1 / 4 表项变体为 4），N 为访问次数，`creates_expected = invalid_ratio_actual × D`（T3–T6 按轮转覆盖全部分块时 D=M；Zipf/步长/指针追逐按实际触及集合统计 D；target 模式按集合精确计算；多线程按 `idx_mode` 分别计算：`private` 取各线程在其私有索引空间上的 D 之和，`shared` 用总访问次数在共享索引空间上计算；T11 按 shared=每个目标索引 1 次、disjoint=各线程私有集合之和单独计算；T12 按测量窗口内的 churn 次数计算；比例取整后以实际值为准） |
+| 慢路径计数 | `creates_actual == creates_expected`；均匀随机访问解析式：触及数 `D ≈ M(1−(1−1/M)^N)`，其中 M 为该用例实际的可触及表项空间（T2 为索引掩码范围、T3–T6 为分块数、T10 为工作集 W、T1 的单表项形态为 1 / 4 表项变体为 4），N 为访问次数，`creates_expected = invalid_ratio_actual × D`（T3–T6 按轮转覆盖全部分块时 D=M；T7 步长按 §4.4 解析式 `M/gcd(S,M)` 估计、以实际触及集合校验；Zipf/指针追逐按实际触及集合统计 D；target 模式按集合精确计算；多线程按 `idx_mode` 分别计算：`private` 取各线程在其私有索引空间上的 D 之和，`shared` 用总访问次数在共享索引空间上计算；T11 按 shared=每个目标索引 1 次、disjoint=各线程私有集合之和单独计算；T12 按测量窗口内的 churn 次数计算；比例取整后以实际值为准） |
 | 快路径形态 | T1 **0% 无效（B1）** 的 `instr_per_op == B0 + VAMAP_CONV_INSNS`（x86-64 strict 默认 8、fast 7；BMI2 `shrx` 变体 7/6；ARM64 为 5；按构建变体断言） |
 | 时延正交性 | B1 在四种时延下 ns_per_op 偏差 ≤ 1% |
 | 重复稳定性 | 中位数 CV ≤ 5%，否则加跑 |

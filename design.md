@@ -185,10 +185,11 @@ orq   %rcx, %rax                ; rax = VA = entry | offset
   用于保留 vva 的 `movq` 在多数微架构上可由重命名阶段消除（move elimination，
   0 执行端口）；零扩展 `movl` 能否消除取决于微架构。OR 的关键路径约 1 cycle；
 - **test/je 宏融合**为 1 uop；`(%rdx,%rcx,8)` 使用比例变址，无需额外 lea；
-- 指令数：**strict 8 条 / 典型 6 uops（范围 5–7；`movq` 通常消除、零扩展 `movl`
-  在部分微架构占 1 个端口，比例变址 load 若计为 2 个 unfused uop 再加 1）**；
+- 指令数：**strict 8 条 / 典型 6 uops（范围 5–8；`movq` 通常消除、零扩展 `movl`
+  在部分微架构占 1 个端口、比例变址 load 若按 unfused 拆分计 2 个 uop，三者全占时
+  取上界）**；
   若构建约定 tag≡0（`VAMAP_FAST_TAG0`），删除 `andl` 后为 **7 条 / 典型 5 uops
-  （范围 4–6）**；
+  （范围 4–7，端口占用口径同上）**；
   构建系统以宏 `VAMAP_CONV_INSNS`（x86-64 strict 8 / fast 7；ARM64 5）把该数值暴露给测试框架，
   供 `instr_per_op` 断言使用（test.md §9.3）；
 - 其中 1 条 `mov` 用于把原 vva 保留给慢路径调用：移位是破坏性操作，而慢路径需要
@@ -226,7 +227,7 @@ bfi  x10, x0, #0, #32           ; 低 32 位插入 offset，保留表项高位
 
 | 方案 | 表项编码 | 合并方式 | 快路径（x86-64） | 评价 |
 |------|----------|----------|------------------|------|
-| **本设计** | `arena + region<<32`（完整基址），无效 = 0 | 零扩展 + `or` 合并 | mov/shr/and/load/test+je/mov/or = 8 条（典型 6 uops，5–7；fast 去 and 为 7 条） | 1 次表 load，无独立 valid 位；要求 arena 4 GiB 对齐 |
+| **本设计** | `arena + region<<32`（完整基址），无效 = 0 | 零扩展 + `or` 合并 | mov/shr/and/load/test+je/mov/or = 8 条（典型 6 uops，范围 5–8；fast 去 and 为 7 条） | 1 次表 load，无独立 valid 位；要求 arena 4 GiB 对齐 |
 | 只存相对 region | `region<<32` | 先加 arena 基址再 or | +1 条（共 9 条） | 表项少存基址，但快路径多一次 add/lea；arena=0 时与本设计同价 |
 | 完整基址但未对齐 | 任意 64 位基址 | `and ~0xFFFFFFFF` + or | +1 条（共 9 条：合并前需清低 32 位） | 不要求 4 GiB 对齐，但合并多一条掩码；对齐后即退化为本设计（直接 or） |
 | valid 位放 bit0 | `(arena + region<<32) \| 1` | and+or 掩掉 valid 位 | +1 条（共 9 条：合并前需 `and` 清 bit0） | 判断仍可整字判零（valid 表项恒非零），合并多一条掩码 |
