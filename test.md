@@ -211,8 +211,9 @@ T12 的连续 churn：通过缩小集合或测量窗口控制每重复 create �
 ### T2 随机全空间访问（表项 cache miss）
 
 - **目的**：表项 miss 各级缓存的行为 + 慢路径混合（readme：随机访问 VVA 使映射表 miss）。
-- **序列**：`idx = xorshift64() & (M−1); off = rand32() & (DATA_WINDOW−1);`（默认 `M = 2^20`）
-  读写随机混合（R:W = 2:1）；`DATA_WINDOW` 默认 4 KiB（可配置）。注意只有配合
+- **序列**：`idx = xorshift64() & (M−1); off = (rand32() & (DATA_WINDOW−1)) & ~7;`（默认 `M = 2^20`）
+  读写随机混合（R:W = 2:1）；`DATA_WINDOW` 默认 4 KiB（可配置），为字节窗口；
+  `off` 是 8 字节对齐的字节偏移（元素 8 字节，不跨出窗口边界）。注意只有配合
   `--alias 1` / alias 池时，数据工作集才是 `池 region 数 × DATA_WINDOW`（默认 ≈256 KiB，
   小而热），从而把增量主要归因于表项 miss；非 alias 路径的数据足迹随触及 region 数增长，
   需按实测单独报告。另设全散列变体作端到端对照（数据 miss 与表项 miss 叠加，B0/B2 同样
