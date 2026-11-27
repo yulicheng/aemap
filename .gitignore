@@ -1,0 +1,5 @@
+# 构建产物（make all 可重建）
+build/
+
+# 基准测试输出（--matrix 可重建）
+results/
