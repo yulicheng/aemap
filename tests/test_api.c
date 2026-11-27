@@ -53,8 +53,12 @@ int main(void)
     CK((uint64_t)(uintptr_t)p1 == (e | 0));
     void *p2 = vva2va(((uint64_t)5 << 32) | 0x80000001ULL);   /* bit31=1 + tag */
     CK((uint64_t)(uintptr_t)p2 == (e | 0x80000001ULL));
+#if !defined(VAMAP_FAST_TAG0)
+    /* strict 契约：52 位及以上（tag）忽略。fast-tag0 构建约定 tag≡0，
+     * 脏 VVA 属契约外输入（快路径无掩码），该专项断言仅属 strict。 */
     void *p3 = vva2va(((uint64_t)0xDBE << 52) | ((uint64_t)5 << 32) | 4096);
     CK((uint64_t)(uintptr_t)p3 == (e | 4096));      /* 随机 tag（12 位）不影响结果 */
+#endif
 
     /* vload/vstore 往返 + 直读一致 */
     vstore64(((uint64_t)5 << 32) | 64, 0x1234567890ABCDEFULL);

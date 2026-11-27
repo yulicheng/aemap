@@ -65,10 +65,15 @@ static int c1_run(void)
     }
     CK(prefill_fail == 0);
 
-    /* 边界组合：idx ∈ {0, 2^20−1} × offset ∈ {0, 2^32−1} × tag ∈ {0, 全1} */
+    /* 边界组合：idx ∈ {0, 2^20−1} × offset ∈ {0, 2^32−1} × tag ∈ {0, 全1}。
+     * fast-tag0 构建约定 tag≡0（快路径无掩码），tag=全1 属契约外输入。 */
     static const uint32_t BIDX[2] = { 0, VAMAP_IDX_MASK };
     static const uint32_t BOFF[2] = { 0, 0xFFFFFFFFu };
+#ifdef VAMAP_FAST_TAG0
+    static const uint64_t BTAG[1] = { 0 };
+#else
     static const uint64_t BTAG[2] = { 0, 0xFFFULL };
+#endif
     for (int a = 0; a < 2; a++)
         for (int b = 0; b < 2; b++)
             for (int t = 0; t < 2; t++) {

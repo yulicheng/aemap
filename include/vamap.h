@@ -35,19 +35,53 @@ extern "C" {
  * 默认（strict）显式掩码，满足 readme 的“52 位及以上忽略”。 */
 /* #define VAMAP_FAST_TAG0 1 */
 
-/* 快路径新增指令数（每访存），供测试框架 instr_per_op 断言使用
- * （test.md §9.3）：x86-64 strict 8 / fast 7（无 BMI2 基线，含保留 vva
- * 的 movq）；ARM64 为 5。 */
+/* BMI2 变体（仅 x86-64）：快路径用非破坏性 shrx 取代 mov+shr（§5.2），
+ * strict 7 / fast 6。构建加 -mbmi2 与 -DVAMAP_BMI2=1。 */
+/* #define VAMAP_BMI2 1 */
+
+/* SVE2 批量变体（仅 aarch64）：吞吐型内核按 VL lane 批量转换（§5.3），
+ * VAMAP_CONV_INSNS 取每批口径 fast 6 / strict 7；构建加
+ * -march=armv9-a+sve2 与 -DVAMAP_SVE2_BATCH=1。 */
+/* #define VAMAP_SVE2_BATCH 1 */
+
+/* 快路径新增指令数，供测试框架 instr_per_op 断言使用（test.md §9.3）：
+ * x86-64 strict 8 / fast 7（无 BMI2 基线，含保留 vva 的 movq）、
+ * BMI2 shrx 变体 strict 7 / fast 6；aarch64 标量 5（strict=fast，
+ * ubfx 天然取 [51:32]）；aarch64 SVE2 批量变体为**每批**口径 fast 6 /
+ * strict 7（断言见 §9.3：(instr(B1)−instr(B0))×VL == VAMAP_CONV_INSNS）。 */
 #if defined(__x86_64__)
-#  if defined(VAMAP_FAST_TAG0)
-#    define VAMAP_CONV_INSNS 7
+#  if defined(VAMAP_BMI2)
+#    if defined(VAMAP_FAST_TAG0)
+#      define VAMAP_CONV_INSNS 6
+#    else
+#      define VAMAP_CONV_INSNS 7
+#    endif
 #  else
-#    define VAMAP_CONV_INSNS 8
+#    if defined(VAMAP_FAST_TAG0)
+#      define VAMAP_CONV_INSNS 7
+#    else
+#      define VAMAP_CONV_INSNS 8
+#    endif
 #  endif
 #elif defined(__aarch64__)
-#  define VAMAP_CONV_INSNS 5
+#  if defined(VAMAP_SVE2_BATCH) && defined(VAMAP_FAST_TAG0)
+#    define VAMAP_CONV_INSNS 6            /* SVE2 批量 fast：每批 6 条 */
+#  elif defined(VAMAP_SVE2_BATCH)
+#    define VAMAP_CONV_INSNS 7            /* SVE2 批量 strict：每批 7 条 */
+#  else
+#    define VAMAP_CONV_INSNS 5            /* aarch64 标量：strict = fast */
+#  endif
 #else
 #  define VAMAP_CONV_INSNS 0
+#endif
+
+/* 逐访存（标量形态）转换指令数：sve2-batch 构建中 T1/T8 等延迟敏感内核
+ * 与正确性语义路径仍以标量形态为准（design.md §5.3 适用范围），其
+ * instr_per_op 断言用本宏；其余构建等于 VAMAP_CONV_INSNS。 */
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+#  define VAMAP_CONV_INSNS_SCALAR 5
+#else
+#  define VAMAP_CONV_INSNS_SCALAR VAMAP_CONV_INSNS
 #endif
 
 /* 时延模拟模式 */
@@ -110,6 +144,126 @@ void *vamap_slow_create_fill(uint64_t vva);
 
 /* TSC 标定（bench 计时借用；进程内首次 init 时标定一次） */
 double vamap_tsc_hz(void);
+
+/* SVE2 批量变体（VAMAP_SVE2_BATCH，design.md §5.3）：
+ * rdvl 探测当前 VL（每向量字节数）；非 sve2-batch 构建恒为 0。
+ * test.md §11：实测 VL 写入结果元数据。 */
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+static inline __attribute__((always_inline))
+uint64_t vamap_sve2_vl_bytes(void)
+{
+    uint64_t v;
+    __asm__ volatile ("rdvl %0, #1" : "=r"(v));
+    return v;
+}
+#else
+static inline __attribute__((always_inline))
+uint64_t vamap_sve2_vl_bytes(void) { return 0; }
+#endif
+
+/* SVE2 批量变体融合宏（VAMAP_SVE2_BATCH，design.md §5.3 / §5.6）。
+ *
+ * B0/B1 宏完全同构：地址向量同为 1 条 index（base + k×8），批谓词同为
+ * 1 条 whilelo，差值只含转换核心（test.md §9.3 每批断言的依据）。
+ * p0 = 批谓词（whilelo n）；任一 lane 表项为 0 → b.any 跳标量退化。
+ * 内部硬编码 z20/z21（及 strict 的 z22）为转换核心临时、p1 为判零谓词，
+ * 调用方 clobber 列表须包含；z23/z24 为宏级临时。
+ * 慢路径：asm goto 跳到调用方标号，整批退化为标量重执行（复用标量
+ * vload64/vstore64 与同一 vamap_slow_create_fill，语义与标量形态一致）。
+ *
+ * strict 合并前掩 tag：SVE 的 and 立即数是破坏性（dest==src），§5.3 所写
+ * 三操作数形式 `and z3.d, z0.d, #imm` 不可编码；改用循环外 svdup 物化的
+ * 向量寄存器掩码（0xFFFFFFFFFFFF），每批仍 1 条 and，口径 fast 6 /
+ * strict 7 不变。
+ */
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+
+/* u64 lane 数 = VL 字节 / 8（rdvl；SVE 规范上限 2048b = 32 lane） */
+static inline __attribute__((always_inline))
+uint32_t vamap_sve2_lanes(void) { return (uint32_t)(vamap_sve2_vl_bytes() / 8); }
+
+/* strict 与 fast 的 idx 掩码均为汇编立即数（#0xFFFFF 合法逻辑立即数），
+ * 无需额外操作数。 */
+
+/* §5.3 批量转换核心：zvva → zva（字符串寄存器名；调用方须有 [vam_tbl] 操作数，
+ * fast 每批 6 条，strict 每批 7 条。
+ *
+ * 合并语义（与 C 参考 vva2va、x86/aarch64 标量路径一致）：VA = entry | offset，
+ * offset 只取 vva 低 32 位——表项 = arena + region<<32（加法），arena 高位的
+ * [51:32] 段非零，若把 vva[63:32]（= idx）一并 OR 进去会破坏区域基址。
+ * 因此两变体的合并都带破坏性 and #0xFFFFFFFF（0xFFFFFFFF 是合法逻辑立即数，
+ * zvva 在此后已死，破坏安全）。
+ * fast 省去的是 idx 掩码 and #0xFFFFF：tag≡0 契约下 idx = vva[63:32] 且构造方
+ * 保证 < 2^20，无需掩码（与 vva2va fast 分支一致）。
+ * 注意 design.md §5.3 fast 序列所写 `orr z2.d, z2.d, z0.d`（整 vva OR）与其
+ * 自身合并语义矛盾，此处按正确语义实现，指令数口径不变（fast 6 / strict 7）。 */
+#if defined(VAMAP_FAST_TAG0)
+#define VAMAP_SVE2_CONV_CORE(zvva, zva, slow)                                \
+    "lsr   z20.d, " zvva ".d, #32                    \n\t"                   \
+    "ld1d  {z21.d}, p0/z, [%[vam_tbl], z20.d, lsl #3] \n\t"                  \
+    "cmpeq p1.d, p0/z, z21.d, #0                     \n\t"                   \
+    "b.any %l[" #slow "]                             \n\t"                   \
+    "and   " zvva ".d, " zvva ".d, #0xFFFFFFFF       \n\t"                   \
+    "orr   " zva ".d, z21.d, " zvva ".d              \n\t"
+#else
+#define VAMAP_SVE2_CONV_CORE(zvva, zva, slow)                                \
+    "lsr   z20.d, " zvva ".d, #32                    \n\t"                   \
+    "and   z20.d, z20.d, #0xFFFFF                    \n\t"                   \
+    "ld1d  {z21.d}, p0/z, [%[vam_tbl], z20.d, lsl #3] \n\t"                  \
+    "cmpeq p1.d, p0/z, z21.d, #0                     \n\t"                   \
+    "b.any %l[" #slow "]                             \n\t"                   \
+    "and   " zvva ".d, " zvva ".d, #0xFFFFFFFF       \n\t"                   \
+    "orr   " zva ".d, z21.d, " zvva ".d              \n\t"
+#endif
+
+/* STREAM 连续批量 gather（stride 固定 8 = u64 元素）：lane k 访问
+ * base + k×8。B0 直接向量访存；B1/B2 先做 §5.3 批量转换序列。
+ * 注意：asm 模板字符串内的 %[name] 不会参与宏参数替换，而操作数标签会——
+ * 故标签一律用与宏参数名不同的固定名（vam_*），仅值位置引用参数。 */
+#define VAMAP_SVE2_BGATHER_B0(zout, base, n)                                 \
+    __asm__ volatile (                                                       \
+        "whilelo p0.d, xzr, %[vam_n]          \n\t"                          \
+        "index  z20.d, %[vam_base], #8        \n\t"                          \
+        "ld1d  {%[vam_zout].d}, p0/z, [z20.d]   \n\t"                          \
+        : [vam_zout] "=&w"((zout))                                           \
+        : [vam_base] "r"((uint64_t)(base)), [vam_n] "r"((uint32_t)(n))       \
+        : "z20", "p0", "cc", "memory")
+
+#define VAMAP_SVE2_BSTORE_B0(zval, base, n)                                  \
+    __asm__ volatile (                                                       \
+        "whilelo p0.d, xzr, %[vam_n]          \n\t"                          \
+        "index  z20.d, %[vam_base], #8        \n\t"                          \
+        "st1d  {%[vam_zval].d}, p0, [z20.d]     \n\t"                          \
+        :                                                                     \
+        : [vam_zval] "w"((zval)), [vam_base] "r"((uint64_t)(base)),          \
+          [vam_n] "r"((uint32_t)(n))                                         \
+        : "z20", "p0", "cc", "memory")
+
+#define VAMAP_SVE2_BGATHER_B1(zout, base, n, tbl, slow)                      \
+    __asm__ volatile goto (                                                  \
+        "whilelo p0.d, xzr, %[vam_n]          \n\t"                          \
+        "index  z23.d, %[vam_base], #8        \n\t"                          \
+        VAMAP_SVE2_CONV_CORE("z23", "z24", slow)                             \
+        "ld1d  {%[vam_zout].d}, p0/z, [z24.d]   \n\t"                          \
+        : [vam_zout] "=&w"((zout))                                           \
+        : [vam_base] "r"((uint64_t)(base)), [vam_n] "r"((uint32_t)(n)),      \
+          [vam_tbl] "r"((uint64_t)(tbl))                                     \
+        : "z20", "z21", "z23", "z24", "p0", "p1", "cc", "memory"             \
+        : slow)
+
+#define VAMAP_SVE2_BSTORE_B1(zval, base, n, tbl, slow)                       \
+    __asm__ volatile goto (                                                  \
+        "whilelo p0.d, xzr, %[vam_n]          \n\t"                          \
+        "index  z23.d, %[vam_base], #8        \n\t"                          \
+        VAMAP_SVE2_CONV_CORE("z23", "z24", slow)                             \
+        "st1d  {%[vam_zval].d}, p0, [z24.d]     \n\t"                          \
+        :                                                                     \
+        : [vam_zval] "w"((zval)), [vam_base] "r"((uint64_t)(base)),          \
+          [vam_n] "r"((uint32_t)(n)), [vam_tbl] "r"((uint64_t)(tbl))         \
+        : "z20", "z21", "z23", "z24", "p0", "p1", "cc", "memory"             \
+        : slow)
+
+#endif /* __aarch64__ && VAMAP_SVE2_BATCH */
 
 /* 快路径读侧共享状态：init 后只被慢路径 release 写、快路径 acquire 读 */
 extern uint64_t *vamap_table;
@@ -175,11 +329,92 @@ void *vva2va(uint64_t vva)
     "popq  %%rbx                 \n\t" /* 恢复 rbx */                   \
     "jmp   2f                    \n\t" /* 冷路径：跳过合并 */
 
+/* idx 提取前缀（§5.2）：strict 带 andl 掩码（52 位及以上忽略）；
+ * fast（VAMAP_FAST_TAG0，tag≡0 契约）省去 andl——vva[63:32] 即 idx，
+ * 构造方保证 < 2^20（与 vva2va fast 分支同契约），strict 8/fast 7、
+ * BMI2 strict 7/fast 6。 */
+#if defined(VAMAP_FAST_TAG0)
+#define VAMAP_X86_IDX_B          "shrx %q3, %q1, %%rcx        \n\t"
+#define VAMAP_X86_IDX            "movq  %1, %%rcx             \n\t"                   \
+                             "shrq  $32, %%rcx            \n\t"
+#else
+#define VAMAP_X86_IDX_B          "shrx %q3, %q1, %%rcx        \n\t"                   \
+                             "andl $0xFFFFF, %%ecx        \n\t"
+#define VAMAP_X86_IDX            "movq  %1, %%rcx             \n\t"                   \
+                             "shrq  $32, %%rcx            \n\t"                   \
+                             "andl  $0xFFFFF, %%ecx       \n\t"
+#endif
+
+#if defined(VAMAP_BMI2)
+/*
+ * BMI2 shrx 变体（§5.2）：非破坏性 shrx 取代 mov+shr 复制，strict 7 /
+ * fast 6。SHRX 无立即数形式，移位量取自寄存器：作为第 3 输入操作数
+ * （%3，常量 32）传入，不在 clobber 列表 → 落在 callee-saved 寄存器，
+ * 循环外物化一次（LICM 提升），且跨慢路径 call 存活，循环内不再复制
+ * vva，rdi 原样保留。
+ * 操作数编号：%0 = 数据，%1 = vva，%2 = 表基址，%3 = 移位量 32。
+ */
+#define VAMAP_X86_LOAD_B(ldop, qk)                                       \
+    __asm__ volatile (                                                   \
+    VAMAP_X86_IDX_B              /* rcx = idx，vva 保留 */               \
+    "movq (%2,%%rcx,8), %%rax    \n\t"   /* entry（唯一一次表 load） */   \
+    "testq %%rax, %%rax          \n\t"                                   \
+    "jne   1f                    \n\t"   /* 有效：跳合并；无效落慢路径 */ \
+    VAMAP_X86_SLOWCALL                                                   \
+    "1: movl  %k1, %%ecx         \n\t"   /* ecx = 零扩展 offset */       \
+    "orq   %%rcx, %%rax          \n\t"   /* rax = VA */                  \
+    "2: " ldop " (%%rax), " qk "0 \n\t"  /* 实际 load */                  \
+    : "=&r"(v) : "r"(vva), "r"(tbl), "r"((uint64_t)32) VAMAP_X86_CLOBBER)
+
+#define VAMAP_X86_STORE_B(stop, k)                                       \
+    __asm__ volatile (                                                   \
+    VAMAP_X86_IDX_B                                                      \
+    "movq (%2,%%rcx,8), %%rax    \n\t"                                   \
+    "testq %%rax, %%rax          \n\t"                                   \
+    "jne   1f                    \n\t"                                   \
+    VAMAP_X86_SLOWCALL                                                   \
+    "1: movl  %k1, %%ecx         \n\t"                                   \
+    "orq   %%rcx, %%rax          \n\t"                                   \
+    "2: " stop " " k "0, (%%rax) \n\t"   /* 实际 store */                 \
+    : : "r"(x), "r"(vva), "r"(tbl), "r"((uint64_t)32) VAMAP_X86_CLOBBER)
+
+static inline __attribute__((always_inline))
+uint64_t vload64(uint64_t vva)
+{
+    uint64_t v;
+    uint64_t tbl = (uint64_t)(uintptr_t)vamap_table;
+    VAMAP_X86_LOAD_B("movq", "%q");
+    return v;
+}
+
+static inline __attribute__((always_inline))
+uint32_t vload32(uint64_t vva)
+{
+    uint32_t v;
+    uint64_t tbl = (uint64_t)(uintptr_t)vamap_table;
+    VAMAP_X86_LOAD_B("movl", "%k");
+    return v;
+}
+
+static inline __attribute__((always_inline))
+void vstore64(uint64_t vva, uint64_t x)
+{
+    uint64_t tbl = (uint64_t)(uintptr_t)vamap_table;
+    VAMAP_X86_STORE_B("movq", "%q");
+}
+
+static inline __attribute__((always_inline))
+void vstore32(uint64_t vva, uint32_t x)
+{
+    uint64_t tbl = (uint64_t)(uintptr_t)vamap_table;
+    VAMAP_X86_STORE_B("movl", "%k");
+}
+
+#else /* 非 BMI2：mov + shr 基线（strict 8 / fast 7） */
+
 #define VAMAP_X86_LOAD(ldop, qk)                                         \
     __asm__ volatile (                                                   \
-    "movq  %1, %%rcx             \n\t"                                   \
-    "shrq  $32, %%rcx            \n\t"                                   \
-    "andl  $0xFFFFF, %%ecx       \n\t"   /* idx，忽略 tag */              \
+    VAMAP_X86_IDX                /* rcx = idx（strict 带掩码） */         \
     "movq  (%2,%%rcx,8), %%rax   \n\t"   /* entry（唯一一次表 load） */   \
     "testq %%rax, %%rax          \n\t"                                   \
     "jne   1f                    \n\t"   /* 有效：跳合并；无效落慢路径 */ \
@@ -191,9 +426,7 @@ void *vva2va(uint64_t vva)
 
 #define VAMAP_X86_STORE(stop, k)                                         \
     __asm__ volatile (                                                   \
-    "movq  %1, %%rcx             \n\t"                                   \
-    "shrq  $32, %%rcx            \n\t"                                   \
-    "andl  $0xFFFFF, %%ecx       \n\t"                                   \
+    VAMAP_X86_IDX                                                        \
     "movq  (%2,%%rcx,8), %%rax   \n\t"                                   \
     "testq %%rax, %%rax          \n\t"                                   \
     "jne   1f                    \n\t"                                   \
@@ -234,6 +467,7 @@ void vstore32(uint64_t vva, uint32_t x)
     uint64_t tbl = (uint64_t)(uintptr_t)vamap_table;
     VAMAP_X86_STORE("movl", "%k");
 }
+#endif /* VAMAP_BMI2 */
 
 #else /* __aarch64__ */
 /*
@@ -268,7 +502,7 @@ void vstore32(uint64_t vva, uint32_t x)
     "cbnz x10, 1f                \n\t"                                   \
     VAMAP_ARM_SLOWCALL                                                   \
     "1: bfi x10, %1, #0, #32     \n\t"   /* 低 32 位插入 offset */        \
-    "2: " ldop " " w "%0, [x10]  \n\t"   /* 实际 load */                  \
+    "2: " ldop " " w "0, [x10]  \n\t"    /* 实际 load */                  \
     : "=&r"(v) : "r"(vva), "r"(tbl) VAMAP_ARM_CLOBBER)
 
 #define VAMAP_ARM_STORE(stop, w)                                         \
@@ -279,7 +513,7 @@ void vstore32(uint64_t vva, uint32_t x)
     "cbnz x10, 1f                \n\t"                                   \
     VAMAP_ARM_SLOWCALL                                                   \
     "1: bfi x10, %1, #0, #32     \n\t"                                   \
-    "2: " stop " " w "%0, [x10]  \n\t"   /* 实际 store */                 \
+    "2: " stop " " w "0, [x10]  \n\t"    /* 实际 store */                 \
     : : "r"(x), "r"(vva), "r"(tbl) VAMAP_ARM_CLOBBER)
 
 static inline __attribute__((always_inline))

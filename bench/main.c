@@ -18,6 +18,8 @@
 
 #define MAX_REPS_CAP 20
 #define MAX_THREADS  64
+#define REP_MAX_ROWS 16384
+#define REP_MAX_SRC  16
 
 static int         g_pin[256];
 static int         g_npin;
@@ -49,6 +51,10 @@ typedef struct {
     const char *variant;
     const char *out;
     int      list;
+    int      report;                     /* --report：合并/汇总已有结果 */
+    int      compare_arch;               /* --report --compare-arch */
+    const char *src[REP_MAX_SRC];
+    int      nsrc;
 } opts_t;
 
 static uint64_t parse_time_ns(const char *s)
@@ -110,6 +116,7 @@ static void usage(void)
         "           [--max-creates-per-rep C] [--pin 0-7] [--var-u N] [--var-u2 N]\n"
         "           [--variant NAME] [--out FILE]\n"
         "       vamap_bench --matrix --level smoke|standard|full [--out DIR] [--threads 1,4]\n"
+        "       vamap_bench --report --src DIR [--src DIR...] [--compare-arch] [--out DIR]\n"
         "       vamap_bench --list\n");
 }
 
@@ -440,11 +447,18 @@ int bench_run_config(const pattern_ops *pat, run_params *p, FILE *csv,
     /* 聚合 + 输出 */
     double b0_med = 0;
     int    b0_n = rc.nsamples[0];
-    char   notes[128];
+    char   notes[160];
     snprintf(notes, sizeof(notes), "%s%s;clk=%s",
              rc.affinity_n ? ";pin" : "",
              bench_perf_available() ? "" : ";perf-unavailable",
              g_clksrc);
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+    if (vamap_sve2_vl_bytes()) {
+        char vln[32];
+        snprintf(vln, sizeof(vln), ";vl=%u", (unsigned)vamap_sve2_vl_bytes());
+        strncat(notes, vln, sizeof(notes) - strlen(notes) - 1);
+    }
+#endif
 
     for (int mode = 0; mode < 3; mode++) {
         int n = rc.nsamples[mode];
@@ -485,7 +499,7 @@ int bench_run_config(const pattern_ops *pat, run_params *p, FILE *csv,
 
         /* §9.3 一致性：慢路径计数 */
         uint64_t exp = (mode == 2) ? pat->expected_creates(&rc, 2) : 0;
-        char xnote[192];
+        char xnote[256];
         snprintf(xnote, sizeof(xnote), "%s%s",
                  notes,
                  (ms->creates != exp) ? ";CREATE-MISMATCH" : "");
@@ -497,22 +511,49 @@ int bench_run_config(const pattern_ops *pat, run_params *p, FILE *csv,
                     mode == 1 ? "B1" : "B2",
                     (unsigned long long)ms->creates, (unsigned long long)exp);
 
-        /* §9.3 形态：T1 0% B1 的 instr_per_op = B0 + VAMAP_CONV_INSNS */
+        /* §9.3 形态：T1 0% B1 的 instr_per_op = B0 + VAMAP_CONV_INSNS。
+         * sve2-batch 构建下 T1 保持标量形态（design.md §5.3 适用范围），
+         * 断言改用逐访存口径 VAMAP_CONV_INSNS_SCALAR。 */
+        int t1_expect = VAMAP_CONV_INSNS;
+#if defined(VAMAP_SVE2_BATCH)
+        t1_expect = VAMAP_CONV_INSNS_SCALAR;
+#endif
         if (pat->id == 1 && rc.p.invalid_ratio == 0.0 && mode == 1 && b0_n > 0) {
             kern_meas *b0 = &rc.samples[0][0];
             double d0 = b0->ops ? (double)b0->perf[PC_INSTR] / (double)b0->ops : 0;
             double d1 = ms->ops ? (double)ms->perf[PC_INSTR] / (double)ms->ops : 0;
             double delta = d1 - d0;
-            if (fabs(delta - (double)VAMAP_CONV_INSNS) > 1.5) {
+            if (fabs(delta - (double)t1_expect) > 1.5) {
                 fprintf(stderr,
                         "bench: T1 instr_per_op delta=%.2f expected %d (fastpath shape?)\n",
-                        delta, VAMAP_CONV_INSNS);
+                        delta, t1_expect);
                 snprintf(xnote, sizeof(xnote), "%s;INSTR-DEVIATION(%.1f)",
                          notes, delta);
             } else {
                 snprintf(xnote, sizeof(xnote), "%s;INSTR-OK(+%.1f)", notes, delta);
             }
         }
+#if defined(VAMAP_SVE2_BATCH)
+        /* §9.3 每批断言（sve2-batch）：T6 0% B1 的
+         * (instr(B1) − instr(B0)) × VL == VAMAP_CONV_INSNS（每批口径，
+         * fast 6 / strict 7；VL 由 rdvl 探测并记录于 notes） */
+        if (pat->id == 6 && rc.p.invalid_ratio == 0.0 && mode == 1 && b0_n > 0) {
+            kern_meas *b0 = &rc.samples[0][0];
+            double d0 = b0->ops ? (double)b0->perf[PC_INSTR] / (double)b0->ops : 0;
+            double d1 = ms->ops ? (double)ms->perf[PC_INSTR] / (double)ms->ops : 0;
+            double delta = (d1 - d0) * (double)vamap_sve2_lanes();
+            if (fabs(delta - (double)VAMAP_CONV_INSNS) > 1.5) {
+                fprintf(stderr,
+                        "bench: T6 batch instr_per_op×VL=%.2f expected %d\n",
+                        delta, VAMAP_CONV_INSNS);
+                snprintf(xnote, sizeof(xnote), "%s;INSTR-BATCH-DEVIATION(%.1f)",
+                         notes, delta);
+            } else {
+                snprintf(xnote, sizeof(xnote), "%s;INSTR-BATCH-OK(+%.1f×%u)",
+                         notes, delta, (unsigned)vamap_sve2_lanes());
+            }
+        }
+#endif
 
         if (csv)
             bench_emit_row(csv, build_tag, pat, &rc, mode, ms, med, lo, hi,
@@ -560,6 +601,23 @@ static run_params build_params(const opts_t *o, int nth)
     p.pin = g_pin;
     p.suite = g_suite;
     return p;
+}
+
+/* 为 --out 目录补齐缺失的父目录（如 results/smoke/ 需先建 results/），
+ * 末级目录仍由调用方 mkdir（忽略 EEXIST） */
+static void mkdir_parents(const char *out)
+{
+    size_t len = strlen(out), i;
+    char tmp[512];
+    while (len > 1 && out[len - 1] == '/')
+        len--;
+    for (i = 1; i < len; i++) {
+        if (out[i] == '/' && i < sizeof(tmp)) {
+            memcpy(tmp, out, i);
+            tmp[i] = '\0';
+            mkdir(tmp, 0755);           /* 忽略 EEXIST */
+        }
+    }
 }
 
 static int run_single(const opts_t *o, const char *build_tag)
@@ -666,6 +724,316 @@ static int run_matrix(const opts_t *o, FILE *csv, const char *build_tag)
 }
 
 /* ------------------------------------------------------------------ */
+/* --report：合并多目录结果，按 arch/build 分组对比（test.md §11）        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    char      buf[1024];                /* 原始行（arch 已规范化） */
+    char     *fld[48];
+    int       nf;
+    char      arch[32], build[32], pattern[32], variant[64], mode[8];
+    int       test_id, threads;
+    double    ratio, ns_med, cyc, ins, ov_pct;
+    long long latency_ns;
+} rep_row;
+
+static rep_row rep_rows[REP_MAX_ROWS];
+static int     rep_nrows;
+
+typedef struct {
+    int       test_id, threads;
+    double    ratio;
+    long long latency_ns;
+    char      pattern[32], variant[64];
+    int       row_idx[256];             /* 该配置的行索引 */
+    int       n;
+} rep_cfg;
+
+static rep_cfg rep_cfgs[4096];
+static int     rep_ncfg;
+
+static void rep_norm_arch(char *d, size_t cap, const char *s)
+{
+    if (!strcmp(s, "x86_64"))
+        snprintf(d, cap, "x86-64");     /* 统一口径（readme 双架构命名） */
+    else
+        snprintf(d, cap, "%s", s);
+}
+
+static int rep_load_file(const char *path, const char *srcname)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "vamap_bench: --report 无法打开 %s（--src %s）\n",
+                path, srcname);
+        return -1;
+    }
+    char line[2048];
+    int  first = 1;
+    while (fgets(line, sizeof(line), f)) {
+        if (first) {
+            first = 0;
+            if (strncmp(line, "suite,", 6) == 0)
+                continue;               /* 表头 */
+        }
+        size_t L = strlen(line);
+        while (L && (line[L - 1] == '\n' || line[L - 1] == '\r'))
+            line[--L] = 0;
+        if (rep_nrows >= REP_MAX_ROWS) {
+            fprintf(stderr, "vamap_bench: --report 行数超过上限 %d，截断\n",
+                    REP_MAX_ROWS);
+            break;
+        }
+        rep_row *r = &rep_rows[rep_nrows++];
+        snprintf(r->buf, sizeof(r->buf), "%s", line);
+        r->fld[0] = r->buf;
+        r->nf = 1;
+        for (char *q = r->buf; *q && r->nf < 48; q++)
+            if (*q == ',') {
+                *q = 0;
+                r->fld[r->nf++] = q + 1;
+            }
+        if (r->nf < 39) {
+            rep_nrows--;
+            continue;
+        }
+        rep_norm_arch(r->arch, sizeof(r->arch), r->fld[3]);
+        snprintf(r->fld[3], strlen(r->fld[3]) + 1, "%s", r->arch);
+        snprintf(r->build, sizeof(r->build), "%s", r->fld[4]);
+        snprintf(r->pattern, sizeof(r->pattern), "%s", r->fld[6]);
+        snprintf(r->variant, sizeof(r->variant), "%s", r->fld[7]);
+        snprintf(r->mode, sizeof(r->mode), "%s", r->fld[8]);
+        r->test_id    = (int)strtol(r->fld[5][0] == 'T' ? r->fld[5] + 1
+                                                       : r->fld[5], NULL, 10);
+        r->threads    = (int)strtol(r->fld[9], NULL, 10);
+        r->ratio      = strtod(r->fld[12], NULL);
+        r->latency_ns = strtoll(r->fld[15], NULL, 10);
+        r->ns_med     = strtod(r->fld[25], NULL);
+        r->cyc        = strtod(r->fld[28], NULL);
+        r->ins        = strtod(r->fld[29], NULL);
+        r->ov_pct     = strtod(r->fld[38], NULL);
+    }
+    fclose(f);
+    return 0;
+}
+
+static int rep_load_src(const char *src)
+{
+    struct stat st;
+    if (stat(src, &st) == 0 && S_ISDIR(st.st_mode)) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s%sresults.csv", src,
+                 src[strlen(src) - 1] == '/' ? "" : "/");
+        return rep_load_file(path, src);
+    }
+    return rep_load_file(src, src);
+}
+
+static int rep_cfg_of(const rep_row *r)
+{
+    for (int i = 0; i < rep_ncfg; i++) {
+        rep_cfg *c = &rep_cfgs[i];
+        if (c->test_id == r->test_id && c->threads == r->threads &&
+            c->latency_ns == r->latency_ns && c->ratio == r->ratio &&
+            !strcmp(c->pattern, r->pattern) &&
+            !strcmp(c->variant, r->variant))
+            return i;
+    }
+    if (rep_ncfg >= (int)(sizeof(rep_cfgs) / sizeof(rep_cfgs[0])))
+        return -1;
+    rep_cfg *c = &rep_cfgs[rep_ncfg++];
+    memset(c, 0, sizeof(*c));
+    c->test_id = r->test_id;
+    c->threads = r->threads;
+    c->ratio = r->ratio;
+    c->latency_ns = r->latency_ns;
+    snprintf(c->pattern, sizeof(c->pattern), "%s", r->pattern);
+    snprintf(c->variant, sizeof(c->variant), "%s", r->variant);
+    return rep_ncfg - 1;
+}
+
+static const rep_row *rep_find(const rep_cfg *c, const char *arch,
+                               const char *build, const char *mode)
+{
+    for (int i = 0; i < c->n; i++) {
+        const rep_row *r = &rep_rows[c->row_idx[i]];
+        if (!strcmp(r->arch, arch) && !strcmp(r->build, build) &&
+            !strcmp(r->mode, mode))
+            return r;
+    }
+    return NULL;
+}
+
+static void rep_fprint_cfg(FILE *f, const rep_cfg *c)
+{
+    fprintf(f, "%s%s th=%d r=%.2f lat=%lldns\n", c->pattern,
+            c->variant[0] ? "/" : "", c->threads, c->ratio, c->latency_ns);
+    if (c->variant[0])
+        fprintf(f, "  variant=%s\n", c->variant);
+    for (int i = 0; i < c->n; i++) {
+        const rep_row *r = &rep_rows[c->row_idx[i]];
+        if (strcmp(r->mode, "B0"))
+            continue;
+        const rep_row *b1 = rep_find(c, r->arch, r->build, "B1");
+        const rep_row *b2 = rep_find(c, r->arch, r->build, "B2");
+        fprintf(f, "  %-9s/%-10s B0 %9.2f | B1 %9.2f (+%6.1f%%)",
+                r->arch, r->build, r->ns_med,
+                b1 ? b1->ns_med : 0.0, b1 ? b1->ov_pct : 0.0);
+        if (b2)
+            fprintf(f, " | B2 %9.2f (+%6.1f%%)", b2->ns_med, b2->ov_pct);
+        if (b1)
+            fprintf(f, " | cyc %7.2f ins %7.2f", b1->cyc, b1->ins);
+        fputc('\n', f);
+    }
+}
+
+static void rep_fprint_compare(FILE *f, const rep_cfg *c)
+{
+    /* 跨架构对比行（§11 图 5 数据面）：同配置下按 arch/build 列出 B1 开销 */
+    const char *arch_seen[8], *build_seen[8];
+    int         nseen = 0;
+    for (int i = 0; i < c->n; i++) {
+        const rep_row *r = &rep_rows[c->row_idx[i]];
+        int seen = 0;
+        for (int k = 0; k < nseen; k++)
+            if (!strcmp(arch_seen[k], r->arch) && !strcmp(build_seen[k], r->build))
+                seen = 1;
+        if (!seen && nseen < 8) {
+            arch_seen[nseen] = r->arch;
+            build_seen[nseen] = r->build;
+            nseen++;
+        }
+    }
+    int narch = 0;
+    for (int k = 0; k < nseen; k++) {
+        int dup = 0;
+        for (int j = 0; j < k; j++)
+            if (!strcmp(arch_seen[j], arch_seen[k]))
+                dup = 1;
+        if (!dup)
+            narch++;
+    }
+    if (narch < 2)
+        return;
+    fprintf(f, "%s%s th=%d r=%.2f lat=%lldns :", c->pattern,
+            c->variant[0] ? "/" : "", c->threads, c->ratio, c->latency_ns);
+    for (int k = 0; k < nseen; k++) {
+        const rep_row *b1 = rep_find(c, arch_seen[k], build_seen[k], "B1");
+        fprintf(f, " %s/%s ov=", arch_seen[k], build_seen[k]);
+        if (b1)
+            fprintf(f, "+%.1f%% cyc=%.2f", b1->ov_pct, b1->cyc);
+        else
+            fprintf(f, "n/a");
+        fprintf(f, " |");
+    }
+    fputc('\n', f);
+}
+
+static int run_report(const opts_t *o)
+{
+    if (!o->nsrc) {
+        fprintf(stderr, "vamap_bench: --report 需要 --src DIR/FILE\n");
+        return 2;
+    }
+    for (int i = 0; i < o->nsrc; i++)
+        if (rep_load_src(o->src[i]) != 0)
+            return 2;
+    if (!rep_nrows) {
+        fprintf(stderr, "vamap_bench: --report 未读到数据行\n");
+        return 2;
+    }
+
+    /* 配置分组（保持出现顺序） */
+    for (int i = 0; i < rep_nrows; i++) {
+        int ci = rep_cfg_of(&rep_rows[i]);
+        if (ci < 0)
+            break;
+        rep_cfg *c = &rep_cfgs[ci];
+        if (c->n < (int)(sizeof(c->row_idx) / sizeof(c->row_idx[0])))
+            c->row_idx[c->n++] = i;
+    }
+
+    FILE *fsum = stdout, *fmerged = NULL;
+    char  merged_path[512], sum_path[512];
+    int   want_merged = 0;
+    if (o->out && o->out[0]) {
+        struct stat st;
+        int isdir = (stat(o->out, &st) == 0 && S_ISDIR(st.st_mode)) ||
+                    o->out[strlen(o->out) - 1] == '/';
+        if (isdir) {
+            mkdir_parents(o->out);
+            mkdir(o->out, 0755);        /* 忽略 EEXIST */
+            snprintf(merged_path, sizeof(merged_path), "%s%smerged.csv",
+                     o->out, o->out[strlen(o->out) - 1] == '/' ? "" : "/");
+            snprintf(sum_path, sizeof(sum_path), "%s%sreport.txt",
+                     o->out, o->out[strlen(o->out) - 1] == '/' ? "" : "/");
+            want_merged = 1;
+        } else {
+            snprintf(sum_path, sizeof(sum_path), "%s", o->out);
+        }
+        fsum = fopen(sum_path, "w");
+        if (!fsum) {
+            fprintf(stderr, "vamap_bench: cannot open %s\n", sum_path);
+            return 2;
+        }
+        if (want_merged)
+            fmerged = fopen(merged_path, "w");
+    }
+
+    /* 1) 合并 CSV（arch 规范化后按行重排） */
+    if (fmerged) {
+        bench_csv_header(fmerged);
+        for (int i = 0; i < rep_nrows; i++) {
+            const rep_row *r = &rep_rows[i];
+            for (int j = 0; j < r->nf; j++)
+                fprintf(fmerged, "%s%s", r->fld[j], j + 1 < r->nf ? "," : "");
+            fputc('\n', fmerged);
+        }
+        fclose(fmerged);
+    }
+
+    /* 2) 汇总报告 */
+    int groups[64], ngroups = 0;
+    char garch[64][32], gbuild[64][32];
+    for (int i = 0; i < rep_nrows; i++) {
+        const rep_row *r = &rep_rows[i];
+        int k = 0;
+        for (; k < ngroups; k++)
+            if (!strcmp(garch[k], r->arch) && !strcmp(gbuild[k], r->build))
+                break;
+        if (k == ngroups && ngroups < 64) {
+            snprintf(garch[ngroups], sizeof(garch[ngroups]), "%s", r->arch);
+            snprintf(gbuild[ngroups], sizeof(gbuild[ngroups]), "%s", r->build);
+            groups[ngroups] = 0;
+            ngroups++;
+            k = ngroups - 1;
+        }
+        if (k < ngroups)
+            groups[k]++;
+    }
+    fprintf(fsum, "== vamap report: %d rows, %d sources, %d configs ==\n",
+            rep_nrows, o->nsrc, rep_ncfg);
+    for (int k = 0; k < ngroups; k++)
+        fprintf(fsum, "  %s/%s: %d rows\n", garch[k], gbuild[k], groups[k]);
+
+    fprintf(fsum, "== configs ==\n");
+    for (int i = 0; i < rep_ncfg; i++)
+        rep_fprint_cfg(fsum, &rep_cfgs[i]);
+    if (o->compare_arch) {
+        fprintf(fsum, "== compare-arch ==\n");
+        for (int i = 0; i < rep_ncfg; i++)
+            rep_fprint_compare(fsum, &rep_cfgs[i]);
+    }
+
+    if (fsum != stdout) {
+        fclose(fsum);
+        printf("vamap_bench: report written to %s%s\n", sum_path,
+               want_merged ? " (+ merged.csv)" : "");
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -754,6 +1122,14 @@ int main(int argc, char **argv)
         } else if (!strcmp(a, "--variant") && i + 1 < argc) {
             i++;
             o.variant = argv[i];
+        } else if (!strcmp(a, "--report")) {
+            o.report = 1;
+        } else if (!strcmp(a, "--src") && i + 1 < argc) {
+            i++;
+            if (o.nsrc < REP_MAX_SRC)
+                o.src[o.nsrc++] = argv[i];
+        } else if (!strcmp(a, "--compare-arch")) {
+            o.compare_arch = 1;
         } else if (!strcmp(a, "--out") && i + 1 < argc) {
             i++;
             o.out = argv[i];
@@ -770,7 +1146,11 @@ int main(int argc, char **argv)
     }
 
     static char tag[64];
-#ifdef VAMAP_FAST_TAG0
+#if defined(VAMAP_SVE2_BATCH)
+    snprintf(tag, sizeof(tag), "sve2-batch");
+#elif defined(VAMAP_BMI2)
+    snprintf(tag, sizeof(tag), "bmi2");
+#elif defined(VAMAP_FAST_TAG0)
     snprintf(tag, sizeof(tag), "fast-tag0");
 #else
     snprintf(tag, sizeof(tag), "strict");
@@ -781,12 +1161,25 @@ int main(int argc, char **argv)
         strncat(tag, tmp, sizeof(tag) - strlen(tag) - 1);
     }
 
+#if defined(VAMAP_SVE2_BATCH)
+    /* sve2-batch 构建要求 SVE2 硬件（test.md §3.1：模拟器仅限正确性套件） */
+    if (vamap_sve2_vl_bytes() == 0) {
+        fprintf(stderr, "vamap_bench: sve2-batch 构建需要 SVE2 硬件（rdvl=0）\n");
+        return 1;
+    }
+#endif
+
     if (o.list) {
         printf("patterns:\n");
         for (int i = 0; i < pattern_count(); i++)
             printf("  T%-2d %s (pool_need=%u)\n", pattern_at(i)->id,
                    pattern_at(i)->name, pattern_at(i)->pool_need);
         return 0;
+    }
+
+    if (o.report) {
+        int rc = run_report(&o);
+        return rc;
     }
 
     if (o.suite_correctness) {
@@ -823,6 +1216,7 @@ int main(int argc, char **argv)
             int isdir = (stat(o.out, &st) == 0 && S_ISDIR(st.st_mode)) ||
                         o.out[strlen(o.out) - 1] == '/';
             if (isdir) {
+                mkdir_parents(o.out);
                 mkdir(o.out, 0755);         /* 忽略 EEXIST */
                 snprintf(path, sizeof(path), "%s%sresults.csv",
                          o.out, o.out[strlen(o.out) - 1] == '/' ? "" : "/");

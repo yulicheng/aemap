@@ -18,6 +18,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+#include <arm_sve.h>
+#endif
 
 #define GOLDEN 0x9E3779B97F4A7C15ULL
 
@@ -62,6 +65,11 @@ static inline uint32_t log2i(uint32_t v)
         r++;
     return r;
 }
+
+/* ------------------------------------------------------------------ */
+/* SVE2 批量变体（design.md §5.3 适用范围：吞吐型内核 T2/T3–T6/T9/T10    */
+/* 的 B1 稳态段；T1/T8/T15 与正确性路径保持标量形态）                    */
+/* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
 /* 运行时控制：按需（池大小/时延模式）重建 runtime；状态重置一律 latency 0 */
@@ -247,6 +255,439 @@ typedef struct {
     uint32_t *t14_list;
     uint8_t  *t14_b0;
 } priv_t;
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+
+static int  stream_accesses(int kind);
+static uint32_t t9_key(const priv_t *pr, double u);
+
+/*
+ * 随机内核（T2/T9/T10）批量 flush 宏：每 lane 一次随机访存，标量 RNG 产
+ * x[]（与 replay 同序，B0/B1 共享同一段 staging 代码）后整批转换。
+ * B0/B1 共享前缀，B1 多出 vva 构建（2 条）而 B0 多出 va 基 gather+orr
+ * （2 条），差值只含 §5.3 转换核心（fast 6 / strict 7）。
+ * 寄存器分工：z25–z31 数据临时，p2/p3 = load/store 谓词；z20/z21、
+ * p0/p1 为 VAMAP_SVE2_CONV_CORE 内部资源。zld 输出供 C 端 svaddv 汇总。
+ * 慢路径：任一 lane 无效 → 标量退化（复用 vload64/vstore64）。
+ */
+#define VAMAP_FLUSH_T2_B1(zld, xarr, n, tbl, vmm1, vdwm1, sink, slow)   \
+    __asm__ volatile goto (                                                  \
+        "whilelo p0.d, xzr, %[vam_n]                     \n\t"                   \
+        "index  z25.d, %[vam_xarr], #8                   \n\t"                   \
+        "ld1d  {z26.d}, p0/z, [z25.d]                  \n\t"                   \
+        "and   z27.d, z26.d, %[vam_vmm1].d                  \n\t"                   \
+        "lsr   z28.d, z26.d, #32                     \n\t"                   \
+        "and   z28.d, z28.d, %[vam_vdwm1].d                 \n\t"                   \
+        "and   z28.d, z28.d, #0xFFFFFFFFFFFFFFF8     \n\t"                   \
+        "lsl   z29.d, z27.d, #32                     \n\t"                   \
+        "orr   z29.d, z29.d, z28.d                   \n\t"                   \
+        VAMAP_SVE2_CONV_CORE("z29", "z30", slow)                             \
+        "lsr   z31.d, z26.d, #48                     \n\t"                   \
+        "and   z31.d, z31.d, #3                      \n\t"                   \
+        "cmplt p2.d, p0/z, z31.d, #2                 \n\t"                   \
+        "cmpls p3.d, p0/z, z31.d, #2                 \n\t"                   \
+        "ld1d  {%[vam_zld].d}, p2/z, [z30.d]               \n\t"                   \
+        "mov   z25.d, %[vam_sink]                        \n\t"                   \
+        "st1d  {z25.d}, p3, [z30.d]                    \n\t"                   \
+        : [vam_zld] "=&w"((zld))                                                 \
+        : [vam_xarr] "r"((uint64_t)(uintptr_t)(xarr)), [vam_n] "r"((uint32_t)(n)),   \
+          [vam_tbl] "r"((uint64_t)(tbl)), [vam_vmm1] "w"((vmm1)),            \
+          [vam_vdwm1] "w"((vdwm1)), [vam_sink] "r"((uint64_t)(sink))         \
+        : "z20", "z21", "z25", "z26", "z27", "z28", "z29", "z30",     \
+          "z31", "p0", "p1", "p2", "p3", "cc", "memory"                      \
+        : slow)
+
+#define VAMAP_FLUSH_T2_B0(zld, xarr, n, vatbl, vmm1, vdwm1, sink)              \
+    __asm__ volatile (                                                       \
+        "whilelo p0.d, xzr, %[vam_n]                     \n\t"                   \
+        "index  z25.d, %[vam_xarr], #8                   \n\t"                   \
+        "ld1d  {z26.d}, p0/z, [z25.d]                  \n\t"                   \
+        "and   z27.d, z26.d, %[vam_vmm1].d                  \n\t"                   \
+        "lsr   z28.d, z26.d, #32                     \n\t"                   \
+        "and   z28.d, z28.d, %[vam_vdwm1].d                 \n\t"                   \
+        "and   z28.d, z28.d, #0xFFFFFFFFFFFFFFF8     \n\t"                   \
+        "ld1d  {z30.d}, p0/z, [%[vam_vatbl], z27.d, lsl #3] \n\t"                \
+        "orr   z30.d, z30.d, z28.d                   \n\t"                   \
+        "lsr   z31.d, z26.d, #48                     \n\t"                   \
+        "and   z31.d, z31.d, #3                      \n\t"                   \
+        "cmplt p2.d, p0/z, z31.d, #2                 \n\t"                   \
+        "cmpls p3.d, p0/z, z31.d, #2                 \n\t"                   \
+        "ld1d  {%[vam_zld].d}, p2/z, [z30.d]               \n\t"                   \
+        "mov   z25.d, %[vam_sink]                        \n\t"                   \
+        "st1d  {z25.d}, p3, [z30.d]                    \n\t"                   \
+        : [vam_zld] "=&w"((zld))                                                 \
+        : [vam_xarr] "r"((uint64_t)(uintptr_t)(xarr)), [vam_n] "r"((uint32_t)(n)),   \
+          [vam_vatbl] "r"((uint64_t)(vatbl)), [vam_vmm1] "w"((vmm1)),        \
+          [vam_vdwm1] "w"((vdwm1)), [vam_sink] "r"((uint64_t)(sink))         \
+        : "z25", "z26", "z27", "z28", "z30", "z31", "p0", "p2", "p3",        \
+          "cc", "memory")
+
+#define VAMAP_FLUSH_T9_B1(zld, karr, xarr, n, tbl, vdw8m1, sink, slow) \
+    __asm__ volatile goto (                                                  \
+        "whilelo p0.d, xzr, %[vam_n]                     \n\t"                   \
+        "index  z25.d, %[vam_karr], #8                   \n\t"                   \
+        "ld1d  {z26.d}, p0/z, [z25.d]                  \n\t"   /* z_key */     \
+        "index  z25.d, %[vam_xarr], #8                   \n\t"                   \
+        "ld1d  {z27.d}, p0/z, [z25.d]                  \n\t"   /* z_x */       \
+        "and   z28.d, z26.d, %[vam_vdw8m1].d                \n\t"                   \
+        "lsl   z28.d, z28.d, #3                      \n\t"   /* off */       \
+        "lsl   z29.d, z26.d, #32                     \n\t"                   \
+        "orr   z29.d, z29.d, z28.d                   \n\t"   /* vva */       \
+        VAMAP_SVE2_CONV_CORE("z29", "z30", slow)                             \
+        "lsr   z31.d, z27.d, #52                     \n\t"                   \
+        "and   z31.d, z31.d, #3                      \n\t"                   \
+        "cmplt p2.d, p0/z, z31.d, #2                 \n\t"                   \
+        "cmpls p3.d, p0/z, z31.d, #2                 \n\t"                   \
+        "ld1d  {%[vam_zld].d}, p2/z, [z30.d]               \n\t"                   \
+        "mov   z25.d, %[vam_sink]                        \n\t"                   \
+        "st1d  {z25.d}, p3, [z30.d]                    \n\t"                   \
+        : [vam_zld] "=&w"((zld))                                                 \
+        : [vam_karr] "r"((uint64_t)(uintptr_t)(karr)),                           \
+          [vam_xarr] "r"((uint64_t)(uintptr_t)(xarr)), [vam_n] "r"((uint32_t)(n)),   \
+          [vam_tbl] "r"((uint64_t)(tbl)), [vam_vdw8m1] "w"((vdw8m1)),        \
+          [vam_sink] "r"((uint64_t)(sink))                                       \
+        : "z20", "z21", "z25", "z26", "z27", "z28", "z29", "z30",     \
+          "z31", "p0", "p1", "p2", "p3", "cc", "memory"                      \
+        : slow)
+
+#define VAMAP_FLUSH_T9_B0(zld, karr, xarr, n, vatbl, vdw8m1, sink)            \
+    __asm__ volatile (                                                       \
+        "whilelo p0.d, xzr, %[vam_n]                     \n\t"                   \
+        "index  z25.d, %[vam_karr], #8                   \n\t"                   \
+        "ld1d  {z26.d}, p0/z, [z25.d]                  \n\t"                   \
+        "index  z25.d, %[vam_xarr], #8                   \n\t"                   \
+        "ld1d  {z27.d}, p0/z, [z25.d]                  \n\t"                   \
+        "and   z28.d, z26.d, %[vam_vdw8m1].d                \n\t"                   \
+        "lsl   z28.d, z28.d, #3                      \n\t"                   \
+        "ld1d  {z30.d}, p0/z, [%[vam_vatbl], z26.d, lsl #3] \n\t"                \
+        "orr   z30.d, z30.d, z28.d                   \n\t"                   \
+        "lsr   z31.d, z27.d, #52                     \n\t"                   \
+        "and   z31.d, z31.d, #3                      \n\t"                   \
+        "cmplt p2.d, p0/z, z31.d, #2                 \n\t"                   \
+        "cmpls p3.d, p0/z, z31.d, #2                 \n\t"                   \
+        "ld1d  {%[vam_zld].d}, p2/z, [z30.d]               \n\t"                   \
+        "mov   z25.d, %[vam_sink]                        \n\t"                   \
+        "st1d  {z25.d}, p3, [z30.d]                    \n\t"                   \
+        : [vam_zld] "=&w"((zld))                                                 \
+        : [vam_karr] "r"((uint64_t)(uintptr_t)(karr)),                           \
+          [vam_xarr] "r"((uint64_t)(uintptr_t)(xarr)), [vam_n] "r"((uint32_t)(n)),   \
+          [vam_vatbl] "r"((uint64_t)(vatbl)), [vam_vdw8m1] "w"((vdw8m1)),    \
+          [vam_sink] "r"((uint64_t)(sink))                                       \
+        : "z25", "z26", "z27", "z28", "z30", "z31", "p0", "p2", "p3",        \
+          "cc", "memory")
+
+#define VAMAP_FLUSH_T10_B1(zld, xarr, n, tbl, vwm1, slow)              \
+    __asm__ volatile goto (                                                  \
+        "whilelo p0.d, xzr, %[vam_n]                     \n\t"                   \
+        "index  z25.d, %[vam_xarr], #8                   \n\t"                   \
+        "ld1d  {z26.d}, p0/z, [z25.d]                  \n\t"   /* z_x */       \
+        "and   z27.d, z26.d, %[vam_vwm1].d                  \n\t"   /* idx */       \
+        "lsl   z29.d, z27.d, #32                     \n\t"                   \
+        "orr   z29.d, z29.d, #32                     \n\t"   /* vva=idx<<32|32 */ \
+        VAMAP_SVE2_CONV_CORE("z29", "z30", slow)                             \
+        "ld1d  {%[vam_zld].d}, p0/z, [z30.d]               \n\t"                   \
+        : [vam_zld] "=&w"((zld))                                                 \
+        : [vam_xarr] "r"((uint64_t)(uintptr_t)(xarr)), [vam_n] "r"((uint32_t)(n)),   \
+          [vam_tbl] "r"((uint64_t)(tbl)), [vam_vwm1] "w"((vwm1))             \
+        : "z20", "z21", "z25", "z26", "z27", "z29", "z30",            \
+          "p0", "p1", "cc", "memory"                                         \
+        : slow)
+
+#define VAMAP_FLUSH_T10_B0(zld, xarr, n, vatbl, vwm1)                         \
+    __asm__ volatile (                                                       \
+        "whilelo p0.d, xzr, %[vam_n]                     \n\t"                   \
+        "index  z25.d, %[vam_xarr], #8                   \n\t"                   \
+        "ld1d  {z26.d}, p0/z, [z25.d]                  \n\t"                   \
+        "and   z27.d, z26.d, %[vam_vwm1].d                  \n\t"                   \
+        "ld1d  {z30.d}, p0/z, [%[vam_vatbl], z27.d, lsl #3] \n\t"                \
+        "orr   z30.d, z30.d, #32                     \n\t"                   \
+        "ld1d  {%[vam_zld].d}, p0/z, [z30.d]               \n\t"                   \
+        : [vam_zld] "=&w"((zld))                                                 \
+        : [vam_xarr] "r"((uint64_t)(uintptr_t)(xarr)), [vam_n] "r"((uint32_t)(n)),   \
+          [vam_vatbl] "r"((uint64_t)(vatbl)), [vam_vwm1] "w"((vwm1))         \
+        : "z25", "z26", "z27", "z30", "p0", "cc", "memory")
+
+/* STREAM 批量内核（T3–T6）：块内连续 element 为一批（stride 8），B0/B1
+ * 同构（地址向量同为 1 条 index），差值只含 §5.3 转换核心。 */
+static void stream_kernel_batch(run_ctx *rc, int mode, int kind)
+{
+    priv_t *pr = rc->priv;
+    uint32_t ne = pr->st_n_elem, be = pr->st_block_elems, sh = pr->st_sh;
+    uint64_t blk = pr->st_block;
+    double q = pr->st_q;
+    uint64_t acc = (uint64_t)stream_accesses(kind);
+    uint64_t iters = rc->p.ops / acc;
+    volatile uint64_t sink = 0;
+    uint64_t tbl = (uint64_t)(uintptr_t)vamap_table;
+    const uint32_t lanes = vamap_sve2_lanes();
+    const svbool_t pall = svptrue_b64();
+    const svfloat64_t zq = svdup_f64(q);
+    uint64_t done = 0;
+
+    if (mode == 0) {
+        uint64_t bA = (uint64_t)(uintptr_t)pr->st_b0a;
+        uint64_t bB = (uint64_t)(uintptr_t)pr->st_b0b;
+        uint64_t bC = (uint64_t)(uintptr_t)pr->st_b0c;
+        while (done < iters) {
+            uint32_t e = (uint32_t)(done % ne);
+            uint32_t j = e >> sh, eo = e & (be - 1u);
+            uint32_t n = be - eo;
+            if (n > lanes)
+                n = lanes;
+            if ((uint64_t)n > iters - done)
+                n = (uint32_t)(iters - done);
+            uint64_t oA = bA + (uint64_t)j * blk + (uint64_t)eo * 8;
+            uint64_t oB = bB + (uint64_t)j * blk + (uint64_t)eo * 8;
+            uint64_t oC = bC + (uint64_t)j * blk + (uint64_t)eo * 8;
+            svuint64_t zB, zC, zR;
+            switch (kind) {
+            case 3:
+                VAMAP_SVE2_BGATHER_B0(zB, oB, n);
+                VAMAP_SVE2_BSTORE_B0(zB, oA, n);
+                break;
+            case 4:
+                VAMAP_SVE2_BGATHER_B0(zC, oC, n);
+                zR = svreinterpret_u64_f64(
+                    svmul_f64_x(pall, zq, svreinterpret_f64_u64(zC)));
+                VAMAP_SVE2_BSTORE_B0(zR, oA, n);
+                break;
+            case 5: {
+                svuint64_t zA;
+                VAMAP_SVE2_BGATHER_B0(zA, oA, n);
+                VAMAP_SVE2_BGATHER_B0(zB, oB, n);
+                zR = svreinterpret_u64_f64(svadd_f64_x(
+                    pall, svreinterpret_f64_u64(zA),
+                    svreinterpret_f64_u64(zB)));
+                VAMAP_SVE2_BSTORE_B0(zR, oC, n);
+                break;
+            }
+            default:
+                VAMAP_SVE2_BGATHER_B0(zB, oB, n);
+                VAMAP_SVE2_BGATHER_B0(zC, oC, n);
+                zR = svreinterpret_u64_f64(svadd_f64_x(
+                    pall, svreinterpret_f64_u64(zB),
+                    svmul_f64_x(pall, zq, svreinterpret_f64_u64(zC))));
+                VAMAP_SVE2_BSTORE_B0(zR, oA, n);
+                break;
+            }
+            done += n;
+        }
+        sink += d_to_u64(*(volatile double *)&pr->st_b0a[(uint32_t)(iters % ne)]);
+    } else {
+        while (done < iters) {
+            uint32_t e = (uint32_t)(done % ne);
+            uint32_t j = e >> sh, eo = e & (be - 1u);
+            uint32_t n = be - eo;
+            if (n > lanes)
+                n = lanes;
+            if ((uint64_t)n > iters - done)
+                n = (uint32_t)(iters - done);
+            uint64_t oA = ((uint64_t)j << 32) | ((uint64_t)eo * 8);
+            uint64_t oB = ((uint64_t)j << 32) | ((uint64_t)blk + (uint64_t)eo * 8);
+            uint64_t oC = ((uint64_t)j << 32) | (2 * blk + (uint64_t)eo * 8);
+            svuint64_t zB, zC, zR;
+            switch (kind) {
+            case 3:
+                VAMAP_SVE2_BGATHER_B1(zB, oB, n, tbl, st_slow);
+                VAMAP_SVE2_BSTORE_B1(zB, oA, n, tbl, st_slow);
+                break;
+            case 4:
+                VAMAP_SVE2_BGATHER_B1(zC, oC, n, tbl, st_slow);
+                zR = svreinterpret_u64_f64(
+                    svmul_f64_x(pall, zq, svreinterpret_f64_u64(zC)));
+                VAMAP_SVE2_BSTORE_B1(zR, oA, n, tbl, st_slow);
+                break;
+            case 5: {
+                svuint64_t zA;
+                VAMAP_SVE2_BGATHER_B1(zA, oA, n, tbl, st_slow);
+                VAMAP_SVE2_BGATHER_B1(zB, oB, n, tbl, st_slow);
+                zR = svreinterpret_u64_f64(svadd_f64_x(
+                    pall, svreinterpret_f64_u64(zA),
+                    svreinterpret_f64_u64(zB)));
+                VAMAP_SVE2_BSTORE_B1(zR, oC, n, tbl, st_slow);
+                break;
+            }
+            default:
+                VAMAP_SVE2_BGATHER_B1(zB, oB, n, tbl, st_slow);
+                VAMAP_SVE2_BGATHER_B1(zC, oC, n, tbl, st_slow);
+                zR = svreinterpret_u64_f64(svadd_f64_x(
+                    pall, svreinterpret_f64_u64(zB),
+                    svmul_f64_x(pall, zq, svreinterpret_f64_u64(zC))));
+                VAMAP_SVE2_BSTORE_B1(zR, oA, n, tbl, st_slow);
+                break;
+            }
+            done += n;
+            continue;
+        st_slow:
+            /* 整批标量退化：逐 lane 复用标量序列与同一慢路径（§5.3） */
+            for (uint32_t k2 = 0; k2 < n; k2++) {
+                uint64_t vA = oA + (uint64_t)k2 * 8;
+                uint64_t vB = oB + (uint64_t)k2 * 8;
+                uint64_t vC = oC + (uint64_t)k2 * 8;
+                switch (kind) {
+                case 3:
+                    vstore64(vA, vload64(vB));
+                    break;
+                case 4:
+                    vstore64(vA, d_to_u64(q * u64_to_d(vload64(vC))));
+                    break;
+                case 5:
+                    vstore64(vC, d_to_u64(u64_to_d(vload64(vA)) +
+                                          u64_to_d(vload64(vB))));
+                    break;
+                default:
+                    vstore64(vA, d_to_u64(u64_to_d(vload64(vB)) +
+                                          q * u64_to_d(vload64(vC))));
+                    break;
+                }
+            }
+            done += n;
+            continue;
+        }
+        {
+            uint32_t e = (uint32_t)(iters % ne);
+            uint64_t vA = ((uint64_t)(e >> sh) << 32) |
+                          (((uint64_t)(e & (be - 1u))) * 8);
+            sink += d_to_u64(u64_to_d(vload64(vA)));
+        }
+    }
+    __atomic_add_fetch(&rc->ops_actual, iters * acc, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&rc->sink, (uint64_t)sink, __ATOMIC_RELAXED);
+}
+
+/* T2 批量内核（sve2-batch）：x[] 标量 staging（与 replay 同 RNG 序），
+ * flush 宏批量转换 + 向量访存；R:W=2:1 由 p2/p3 逐 lane 判定 */
+static void t2_kernel_batch(run_ctx *rc, int mode, int tid)
+{
+    priv_t *pr = rc->priv;
+    const uint64_t dw = pr->t2_dw;
+    uint64_t s = rc->seq_seed ^ GOLDEN * (uint64_t)(tid + 1);
+    uint64_t ops = rc->p.ops;
+    volatile uint64_t sink = 0;
+    uint64_t tbl = (uint64_t)(uintptr_t)vamap_table;
+    uint64_t vatbl = (uint64_t)(uintptr_t)rc->va_of_idx;
+    const uint64_t mm1 = (uint64_t)rc->M - 1, dwm1 = dw - 1;
+    const svuint64_t vmm1 = svdup_u64(mm1), vdwm1 = svdup_u64(dwm1);
+    const uint32_t lanes = vamap_sve2_lanes();
+    const svbool_t pall = svptrue_b64();
+    uint64_t xarr[64];
+
+    for (uint64_t b = 0; b < ops; b += lanes) {
+        uint32_t n = (uint32_t)(ops - b);
+        if (n > lanes)
+            n = lanes;
+        for (uint32_t k = 0; k < n; k++)
+            xarr[k] = xs64(&s);
+        svuint64_t zld;
+        if (mode == 0)
+            VAMAP_FLUSH_T2_B0(zld, xarr, n, vatbl, vmm1, vdwm1, sink);
+        else
+            VAMAP_FLUSH_T2_B1(zld, xarr, n, tbl, vmm1, vdwm1, sink,
+                              t2f_slow);
+        sink += svaddv_u64(pall, zld);
+        continue;
+    t2f_slow:
+        for (uint32_t k = 0; k < n; k++) {
+            uint64_t x = xarr[k];
+            uint64_t vva = ((uint64_t)(x & mm1) << 32) |
+                           (((x >> 32) & dwm1) & ~7ULL);
+            if (((x >> 48) & 3) < 2)
+                sink += vload64(vva);
+            else
+                vstore64(vva, sink);
+        }
+        continue;
+    }
+    __atomic_add_fetch(&rc->ops_actual, ops, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&rc->sink, (uint64_t)sink, __ATOMIC_RELAXED);
+}
+
+/* T9 批量内核（sve2-batch）：RNG+CDF 二分保持标量（与 replay 同序），
+ * key[]/x[] staging 后 flush 批量转换 */
+static void t9_kernel_batch(run_ctx *rc, int mode, int tid)
+{
+    priv_t *pr = rc->priv;
+    uint64_t s = rc->seq_seed ^ GOLDEN * (uint64_t)(tid + 1);
+    uint64_t ops = rc->p.ops;
+    volatile uint64_t sink = 0;
+    uint64_t tbl = (uint64_t)(uintptr_t)vamap_table;
+    uint64_t vatbl = (uint64_t)(uintptr_t)rc->va_of_idx;
+    const uint64_t dw8m1 = 4096 / 8 - 1;            /* 数据窗口固定 4096B */
+    const svuint64_t vdw8m1 = svdup_u64(dw8m1);
+    const uint32_t lanes = vamap_sve2_lanes();
+    const svbool_t pall = svptrue_b64();
+    uint64_t xarr[64], karr[64];
+
+    for (uint64_t b = 0; b < ops; b += lanes) {
+        uint32_t n = (uint32_t)(ops - b);
+        if (n > lanes)
+            n = lanes;
+        for (uint32_t k = 0; k < n; k++) {
+            uint64_t x = xs64(&s);
+            xarr[k] = x;
+            karr[k] = t9_key(pr, (double)(x >> 11) * (1.0 / 9007199254740992.0));
+        }
+        svuint64_t zld;
+        if (mode == 0)
+            VAMAP_FLUSH_T9_B0(zld, karr, xarr, n, vatbl, vdw8m1, sink);
+        else
+            VAMAP_FLUSH_T9_B1(zld, karr, xarr, n, tbl, vdw8m1, sink,
+                              t9f_slow);
+        sink += svaddv_u64(pall, zld);
+        continue;
+    t9f_slow:
+        for (uint32_t k = 0; k < n; k++) {
+            uint64_t key = karr[k], x = xarr[k];
+            uint64_t vva = (key << 32) | (((uint64_t)key & dw8m1) << 3);
+            if (((x >> 52) & 3) < 2)
+                sink += vload64(vva);
+            else
+                vstore64(vva, sink);
+        }
+        continue;
+    }
+    __atomic_add_fetch(&rc->ops_actual, ops, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&rc->sink, (uint64_t)sink, __ATOMIC_RELAXED);
+}
+
+/* T10 批量内核（sve2-batch）：x[] staging 后 flush 批量转换（全 load） */
+static void t10_kernel_batch(run_ctx *rc, int mode, int tid)
+{
+    priv_t *pr = rc->priv;
+    uint32_t W = pr->t10_W;
+    uint64_t s = rc->seq_seed ^ GOLDEN * (uint64_t)(tid + 1);
+    uint64_t ops = rc->p.ops;
+    volatile uint64_t sink = 0;
+    uint64_t tbl = (uint64_t)(uintptr_t)vamap_table;
+    uint64_t vatbl = (uint64_t)(uintptr_t)rc->va_of_idx;
+    const uint64_t wm1 = (uint64_t)W - 1;
+    const svuint64_t vwm1 = svdup_u64(wm1);
+    const uint32_t lanes = vamap_sve2_lanes();
+    const svbool_t pall = svptrue_b64();
+    uint64_t xarr[64];
+
+    for (uint64_t b = 0; b < ops; b += lanes) {
+        uint32_t n = (uint32_t)(ops - b);
+        if (n > lanes)
+            n = lanes;
+        for (uint32_t k = 0; k < n; k++)
+            xarr[k] = xs64(&s);
+        svuint64_t zld;
+        if (mode == 0)
+            VAMAP_FLUSH_T10_B0(zld, xarr, n, vatbl, vwm1);
+        else
+            VAMAP_FLUSH_T10_B1(zld, xarr, n, tbl, vwm1, t10f_slow);
+        sink += svaddv_u64(pall, zld);
+        continue;
+    t10f_slow:
+        for (uint32_t k = 0; k < n; k++)
+            sink += vload64(((xarr[k] & wm1) << 32) | 32);
+        continue;
+    }
+    __atomic_add_fetch(&rc->ops_actual, ops, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&rc->sink, (uint64_t)sink, __ATOMIC_RELAXED);
+}
+
+#endif /* __aarch64__ && VAMAP_SVE2_BATCH */
 
 /* ------------------------------------------------------------------ */
 /* T1 热点相邻访问（表项 L1 命中）——4 份等价表项变体（§4.2）             */
@@ -340,6 +781,10 @@ static int t2_setup(run_ctx *rc)
 static void t2_kernel(run_ctx *rc, int mode, int tid, int nthreads)
 {
     (void)nthreads;
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+    t2_kernel_batch(rc, mode, tid);       /* 吞吐内核走 §5.3 批量形态 */
+    return;
+#endif
     priv_t *pr = rc->priv;
     uint32_t M = rc->M;
     const uint64_t dw = pr->t2_dw;        /* DATA_WINDOW（默认 4KiB，可配 64M 变体） */
@@ -459,6 +904,14 @@ static void stream_warm(run_ctx *rc, int phase)
 static void stream_kernel(run_ctx *rc, int mode, int tid, int nthreads, int kind)
 {
     (void)tid; (void)nthreads;
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+    if (kind != 15) {
+        /* T3–T6 走 §5.3 批量形态；T15 保留标量以维持逐次访问 vs
+         * hoist 的对比口径（design.md §5.3 适用范围） */
+        stream_kernel_batch(rc, mode, kind);
+        return;
+    }
+#endif
     priv_t *pr = rc->priv;
     uint32_t ne = pr->st_n_elem, be = pr->st_block_elems, sh = pr->st_sh;
     uint64_t blk = pr->st_block;
@@ -752,6 +1205,10 @@ static int t9_setup(run_ctx *rc)
 static void t9_kernel(run_ctx *rc, int mode, int tid, int nthreads)
 {
     (void)nthreads;
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+    t9_kernel_batch(rc, mode, tid);       /* 吞吐内核走 §5.3 批量形态 */
+    return;
+#endif
     priv_t *pr = rc->priv;
     const uint64_t dw = 4096;
     uint64_t s = rc->seq_seed ^ GOLDEN * (uint64_t)(tid + 1);
@@ -830,6 +1287,10 @@ static int t10_setup(run_ctx *rc)
 static void t10_kernel(run_ctx *rc, int mode, int tid, int nthreads)
 {
     (void)nthreads;
+#if defined(__aarch64__) && defined(VAMAP_SVE2_BATCH)
+    t10_kernel_batch(rc, mode, tid);      /* 吞吐内核走 §5.3 批量形态 */
+    return;
+#endif
     priv_t *pr = rc->priv;
     uint32_t W = pr->t10_W;
     uint64_t s = rc->seq_seed ^ GOLDEN * (uint64_t)(tid + 1);
