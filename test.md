@@ -182,7 +182,8 @@ T12 的连续 churn：通过缩小集合或测量窗口控制每重复 create �
 > 正确性套件默认 `create_latency_ns = 0`（C6 显式遍历 4 档时延）；否则 C5 的
 > 10^6 次 create/destroy 会被模拟时延放大到小时级。C1 的 alias 预填也不计时延。
 > C1 除 10^7 随机向量外，还显式覆盖边界组合：idx ∈ {0, 2^20−1}、offset ∈ {0, 2^32−1}、
-> tag ∈ {0, 全 1}。
+> tag ∈ {0, 全 1}。随机/全 1 tag 的断言只适用于 strict 构建；`VAMAP_FAST_TAG0`
+> 构建须把 tag 固定为 0 再跑，否则按设计预期失败。
 
 ## 6. 性能测试用例
 
@@ -416,7 +417,7 @@ T12 的连续 churn：通过缩小集合或测量窗口控制每重复 create �
 
 | 校验 | 判据 |
 |------|------|
-| 慢路径计数 | `creates_actual == creates_expected`；均匀随机访问解析式：触及数 `D ≈ M(1−(1−1/M)^N)`，其中 M 为该用例实际的可触及表项空间（T2 为索引掩码范围、T3–T6 为分块数、T10 为工作集 W、T1 的单表项形态为 1 / 4 表项变体为 4），N 为访问次数，`creates_expected = invalid_ratio_actual × D`（Zipf/步长/指针追逐按实际触及集合统计 D；target 模式按集合精确计算；T11 按 shared=每个目标索引 1 次、disjoint=各线程私有集合之和单独计算；T12 按测量窗口内的 churn 次数计算；比例取整后以实际值为准） |
+| 慢路径计数 | `creates_actual == creates_expected`；均匀随机访问解析式：触及数 `D ≈ M(1−(1−1/M)^N)`，其中 M 为该用例实际的可触及表项空间（T2 为索引掩码范围、T3–T6 为分块数、T10 为工作集 W、T1 的单表项形态为 1 / 4 表项变体为 4），N 为访问次数，`creates_expected = invalid_ratio_actual × D`（T3–T6 按轮转覆盖全部分块时 D=M；Zipf/步长/指针追逐按实际触及集合统计 D；target 模式按集合精确计算；多线程按 `idx_mode` 分别计算：`private` 取各线程在其私有索引空间上的 D 之和，`shared` 用总访问次数在共享索引空间上计算；T11 按 shared=每个目标索引 1 次、disjoint=各线程私有集合之和单独计算；T12 按测量窗口内的 churn 次数计算；比例取整后以实际值为准） |
 | 快路径形态 | T1 **0% 无效（B1）** 的 `instr_per_op == B0 + VAMAP_CONV_INSNS`（x86-64 strict 默认 8、fast 7；BMI2 `shrx` 变体 7/6；ARM64 为 5；按构建变体断言） |
 | 时延正交性 | B1 在四种时延下 ns_per_op 偏差 ≤ 1% |
 | 重复稳定性 | 中位数 CV ≤ 5%，否则加跑 |
