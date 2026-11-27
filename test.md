@@ -2,6 +2,8 @@
 
 > 本文档详细描述 VVA→VA 动态地址映射的 overhead 测试框架与全部测试用例。
 > 被测对象的设计（表项编码、快/慢路径、运行时库）见 [design.md](design.md)。
+> 测试框架为**统一的一套**（readme 要求）：同一框架、同一用例、同一参数矩阵与指标
+> 口径覆盖 x86-64 与 aarch64（ARMv9 + SVE2）两个实现版本，结果直接对比（§3.1）。
 
 ## 1. 测试目标与指标
 
@@ -18,7 +20,7 @@
 |------|------|
 | `ns_per_op` / `cycles_per_op` | 每访存耗时（主指标） |
 | `overhead_pct` | 相对基线 B0 的开销百分比：`(T_conv − T_base) / T_base × 100%` |
-| `instr_per_op` | 每访存指令数（B1 应为 B0 + `VAMAP_CONV_INSNS`；x86-64 strict 默认 8、fast 7，表基址驻留寄存器；使用 BMI2 `shrx` 的变体为 strict 7、fast 6；ARM64 为 5；B2 另含慢路径指令） |
+| `instr_per_op` | 每访存指令数（B1 应为 B0 + `VAMAP_CONV_INSNS`；x86-64 strict 默认 8、fast 7，表基址驻留寄存器；使用 BMI2 `shrx` 的变体为 strict 7、fast 6；aarch64 标量为 5；aarch64 SVE2 批量变体为每批口径 fast 6 / strict 7，摊销断言见 §9.3；B2 另含慢路径指令） |
 | `l1m/llc/dtlb/br_per_op` | 每访存 L1 miss、LLC miss、dTLB miss、分支 miss |
 | `creates / destroys` | 慢路径事件计数（与解析预期值比对，一致性校验） |
 | `slow_ns_total / slow_pct` | 慢路径累计耗时（多线程为各线程求和）；`slow_pct = slow_ns_total / (wall_time × threads)`（单线程即占墙钟比例），另报 per-thread 分布（§8） |
@@ -49,7 +51,8 @@ vamap_bench
  ├── harness      矩阵生成 / 调度 / 重复运行 / 基线交错 / 结果聚合
  ├── patterns     T1–T15 访存内核（每内核提供 B0/B1/B2 三种指针模式）
  ├── state        表状态控制：按比例设置初始无效状态（rand/target）、alias 预填、每次重复前重置
- ├── timer        rdtsc(fenced) 计时 + wall clock；perf_event_open 或 perf stat 封装
+ ├── timer        架构抽象计时（x86-64：rdtsc+lfence；aarch64：cntvct_el0）+ wall clock；
+ │                perf_event_open 或 perf stat 封装
  ├── runtime      vamap 运行时控制：latency/mode、stats 读取、destroy 注入
  └── report       CSV/JSON 输出、汇总表、绘图脚本（matplotlib）
 ```
@@ -57,14 +60,38 @@ vamap_bench
 CLI（`bench/` 产物）：
 
 ```text
-vamap_bench --suite correctness                     # 正确性门槛
+vamap_bench --suite correctness                     # 正确性门槛（两架构各自先过）
 vamap_bench --test T6 [参数...] [--out results/t6.csv]
 vamap_bench --matrix --level smoke|standard|full --out results/
+vamap_bench --report --src DIR [--src DIR...] [--compare-arch]   # 汇总/绘图（§11）；
+                                                                 # --compare-arch 跨架构对比
 参数：--threads N[,N…]  --idx-mode private|shared  --invalid 0|0.25|0.5|0.75|1
       --invalid-scope rand|target  --latency 10us|100us|1ms|10ms
       --latency-mode spin|sleep  --alias 0|1
       --ops N  --reps N  --max-creates-per-rep C  --pin 0-7
 ```
+
+### 3.1 双架构统一测试（readme 要求）
+
+同一套框架源码覆盖 x86-64 与 aarch64 两个实现版本，任何用例、参数、指标与输出
+schema 均不因架构而异：
+
+- **同一构建入口**：x86-64 主机上 `make`、aarch64 主机上原生 `make`（或交叉编译后拷贝
+  到目标机执行）产出同一 `vamap_bench` CLI；两实现共享 `include/vamap.h` 的公共 API
+  与架构无关运行时 `src/vamap_runtime.c`（design.md §3），仅快路径内联分支按架构选择
+  （design.md §5.2/§5.3）；
+- **执行顺序**：每个架构先在目标机**原生**跑 §5 正确性门槛（C1–C7 全过），再跑同一
+  §4.1 矩阵；矩阵取值、执行流程、重复与噪声控制策略两架构完全相同；
+- **构建变体**：`strict` / `fast-tag0` 为两架构公共变体；`bmi2` 仅 x86-64，
+  `sve2-batch` 仅 aarch64（design.md §5.2/§5.3）。**跨架构主对比口径**为两架构同源的
+  strict 标量/C 形态；架构最优变体（readme：x86-64 BMI2、aarch64 SVE2）单独列示，
+  展示最优指令收益，不与另一架构的变体混比；
+- **平台差异只进元数据**：REGION_COUNT 回退档位（design.md §6.2）、SVE2 实测 VL
+  （`rdvl`）、大页驻留方式等记录在结果元数据（§11），不改变矩阵结构与指标口径；
+- **性能必须在原生主机测量**：禁止用模拟器（qemu 等）测性能——时钟校准与 perf 计数
+  不可信；模拟器仅可运行正确性套件（C1–C7）并在 `notes` 标注；
+- **结果合并**：两台主机的 results 目录按 CSV 的 `arch`/`build` 列合并
+  （`--report --compare-arch`，§11 图 5），保证 readme 要求的"测试结果可直接对比"。
 
 ## 4. 参数矩阵与执行语义
 
@@ -85,6 +112,9 @@ vamap_bench --matrix --level smoke|standard|full --out results/
 - T11（首触竞争）与 T12（churn）的无效压力由用例自身注入（T11 的竞争语义以目标表项
   失效为前提，T12 持续销毁–重建）；矩阵的 `invalid_ratio` 对它们只影响初始状态与
   0%/100% 对照，不改变用例的稳态语义。
+- 矩阵与架构无关：x86-64 与 aarch64 两个实现版本跑**同一矩阵**（readme：统一一套
+  测试框架），每个架构先过 §5 正确性门槛；平台相关差异只记录在结果元数据
+  （§3.1/§11），不改变矩阵取值。
 
 ### 4.2 无效比例语义
 
@@ -191,8 +221,9 @@ T12 的连续 churn：通过缩小集合或测量窗口控制每重复 create �
 = threads × ops）；多线程下主指标按总访存数归一化，另报 per-thread 分布（§8）。
 除 T11/T12 外均为稳定内核（循环体固定）。每个用例同时在 B0/B1/B2
 模式下编译运行，`overhead_pct` 相对 B0。B1/B2 默认使用 design.md §5.6 的 volatile
-融合宏，保证每次 ld/st 都执行一次转换（禁止 CSE 与循环提升）；hoist 对照只在 T15 中
-单独测量。
+融合宏，保证每次 ld/st 都执行一次转换（禁止 CSE 与循环提升）；aarch64 的
+`sve2-batch` 变体使用同构的向量融合宏（design.md §5.3），B0 采用同构向量访存内核，
+保证指令断言的差值只含转换；hoist 对照只在 T15 中单独测量。
 
 ### T1 热点相邻访问（表项 L1 命中）
 
@@ -395,10 +426,14 @@ T12 的连续 churn：通过缩小集合或测量窗口控制每重复 create �
 
 ### 9.1 计时与计数器
 
-- 计时：内核前后 `rdtsc` + `lfence` 序列化；慢路径主导的配置同时记录墙钟；
+- 计时：内核前后序列化 + 周期计数，按架构抽象（x86-64：`rdtsc` + `lfence`；
+  aarch64：`mrs cntvct_el0`，频率经 `cntfrq_el0` 换算）；两架构统一输出
+  cycles_per_op / ns_per_op，口径一致；慢路径主导的配置同时记录墙钟；
 - 硬件计数器：`perf stat -x, -e cycles,instructions,L1-dcache-load-misses,
   LLC-load-misses,dTLB-load-misses,branch-misses,context-switches`；
-  无 perf 权限（`perf_event_paranoid` 受限）时自动降级为纯 rdtsc 并在结果标注；
+  aarch64 上 PMU 事件名/映射可能不同（armv8/v9 PMU），框架按主机探测可用事件，
+  缺失项在 `notes` 记录；无 perf 权限（`perf_event_paranoid` 受限）时自动降级为
+  纯周期计数并在结果标注；
 - 运行时自带计数（slow_calls/creates/spin_ns/slow_ns_total）用于分解与一致性校验；
   对逐次转换内核，`fast_hits` 由框架按"总 ld/st 数 − slow_calls"导出（T15 hoist 版按
   实际转换点数另记）；运行时不在快路径计数（否则会破坏 8 条快路径，见 design.md §6.1）。
@@ -420,13 +455,14 @@ T12 的连续 churn：通过缩小集合或测量窗口控制每重复 create �
 | 校验 | 判据 |
 |------|------|
 | 慢路径计数 | `creates_actual == creates_expected`；均匀随机访问解析式：触及数 `D ≈ M(1−(1−1/M)^N)`，其中 M 为该用例实际的可触及表项空间（T2 为索引掩码范围、T3–T6 为分块数、T10 为工作集 W、T1 的单表项形态为 1 / 4 表项变体为 4），N 为访问次数，`creates_expected = invalid_ratio_actual × D`（T3–T6 按轮转覆盖全部分块时 D=M；T7 步长按 §4.4 解析式 `M/gcd(S,M)` 估计、以实际触及集合校验；Zipf/指针追逐按实际触及集合统计 D；target 模式按集合精确计算；多线程按 `idx_mode` 分别计算：`private` 取各线程在其私有索引空间上的 D 之和，`shared` 用总访问次数在共享索引空间上计算；T11 按 shared=每个目标索引 1 次、disjoint=各线程私有集合之和单独计算；T12 按测量窗口内的 churn 次数计算；比例取整后以实际值为准） |
-| 快路径形态 | T1 **0% 无效（B1）** 的 `instr_per_op == B0 + VAMAP_CONV_INSNS`（x86-64 strict 默认 8、fast 7；BMI2 `shrx` 变体 7/6；ARM64 为 5；按构建变体断言） |
+| 快路径形态 | T1 **0% 无效（B1）** 的 `instr_per_op == B0 + VAMAP_CONV_INSNS`（x86-64 strict 默认 8、fast 7；BMI2 `shrx` 变体 7/6；aarch64 标量为 5；aarch64 SVE2 批量变体按每批断言 `(instr(B1) − instr(B0)) × VL == VAMAP_CONV_INSNS`，fast 6 / strict 7，VL 由 `rdvl` 探测并记录；按构建变体断言） |
 | 时延正交性 | B1 在四种时延下 ns_per_op 偏差 ≤ 1% |
 | 重复稳定性 | 中位数 CV ≤ 5%，否则加跑 |
 
 ## 10. 预期结果与合理性判据
 
-量级预期（3 GHz x86-64 参考量级，具体随微架构/主机变化，用于捕获明显异常）：
+量级预期（3 GHz x86-64 参考量级，具体随微架构/主机变化，用于捕获明显异常；
+aarch64 各档 cycle/op 不同，跨架构口径见下）：
 
 | 场景 | 预期 overhead |
 |------|---------------|
@@ -440,6 +476,15 @@ T12 的连续 churn：通过缩小集合或测量窗口控制每重复 create �
 | T10 | L1/L2/LLC/DRAM 四级台阶清晰 |
 | T11 shared vs disjoint | shared 墙钟 ≈ latency + 交接；disjoint 近线性 |
 | T15 | hoist 版开销 ≈ B0 + 边界检查，明显低于逐次版 |
+
+跨架构口径（readme：两个版本的结果可直接对比）：
+
+- 跨架构对比以 **overhead_pct**（相对各自 B0）为主指标；绝对 cycle/op 不要求跨架构
+  一致（微架构、频率、内存序实现均不同），异常检查按上表量级各自独立执行；
+- aarch64 标量形态：快路径 5 条、`ldar`/`bfi` 关键路径与 x86-64 同阶，T1（0%）量级
+  同样落在 +5–15 cycle/op 附近；`sve2-batch` 变体在吞吐型内核（T2/T3–T6/T9/T10）上
+  转换指令增量低于标量形态（ALU/分支按 VL 摊销），但每访存表项 load 次数不变，
+  带宽受限内核的 overhead 下界由表项 load 决定。
 
 异常处理：任一结果偏离预期量级 2× 以上 → 记录并复查（快路径形态、频控、表大页）。
 
@@ -460,14 +505,20 @@ slow_ns_total,slow_pct,overhead_pct,CV,notes
 `vamap_init` 实际回退到的 region 数与竞技场基址（十六进制），用于复现与解释
 strict/平台差异；T3–T6 的 STREAM 分块数、T7 的步长 S、T10 的工作集 W 记录在
 `variant` 或 `notes` 中，避免与全局 `M` 混淆；T10 的非零比例配置计算
-`creates_expected` 时以 M=W 代入 §9.3 解析式（0% 配置为 0）。
+`creates_expected` 时以 M=W 代入 §9.3 解析式（0% 配置为 0）；`arch`/`build` 记录
+目标架构与构建变体（x86-64：strict / fast-tag0 / bmi2；aarch64：strict / fast-tag0 /
+sve2-batch），跨架构合并对比按这两列分组，aarch64 的 `sve2-batch` 构建把 `rdvl`
+实测 VL 写入 `notes`。
 
 图表清单：
 
 1. overhead 热力图：ratio（5）× latency（4），分 pattern、分 threads；
 2. T10 工作集台阶曲线；T8/T14 延迟分解对比；
 3. 多线程加速比曲线（private/shared × threads）；
-4. T12 开销–churn 间隔曲线；T15 逐次 vs hoist 对比柱状图。
+4. T12 开销–churn 间隔曲线；T15 逐次 vs hoist 对比柱状图；
+5. 跨架构对比图（readme：统一框架测试两个版本）：同 pattern 同矩阵下 x86-64 与
+   aarch64 并列（overhead_pct / cycles_per_op），主口径 strict，bmi2 / sve2-batch
+   变体单独列示。
 
 ## 12. 命令清单
 
@@ -488,6 +539,14 @@ strict/平台差异；T3–T6 的 STREAM 分块数、T7 的步长 S、T10 的工
 
 # 4) 快路径形态抽查
 ./scripts/check_fastpath.sh build/vamap_bench
+
+# 5) aarch64 主机（原生，同一框架、同一 CLI、同一矩阵；readme 统一测试框架要求）
+./build/vamap_bench --suite correctness
+./build/vamap_bench --matrix --threads 1,2,4,8 --level standard --out results/aarch64/
+
+# 6) 合并两架构结果做跨架构对比（§11 图 5；按 arch/build 列分组）
+./build/vamap_bench --report --src results/x86-64/ --src results/aarch64/ \
+    --compare-arch --out results/compare/
 ```
 
 运行预算参考：`full` 档 ≈ 15 pattern × 20 组合 × 5 线程档 × reps 3–5，

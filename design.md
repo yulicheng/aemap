@@ -1,7 +1,8 @@
 # design.md — VVA→VA 动态地址映射设计与实现
 
 > 本文档描述 readme.md 项目目标的实现方式：地址格式与映射模型、映射表与表项编码、
-> 最优的查表转换指令、mock 运行时库（映射创建/销毁/建立时延模拟）、线程安全设计与应用集成方式。
+> 最优的查表转换指令（x86-64 与 aarch64（ARMv9 + SVE2）双架构实现，readme 要求）、
+> mock 运行时库（映射创建/销毁/建立时延模拟）、线程安全设计与应用集成方式。
 > 测试框架与测试用例在 [test.md](test.md) 中详细描述。
 
 ## 1. 概述
@@ -23,7 +24,10 @@
 1. **快路径指令数最少**：每次 ld/st 仅新增一次表项 load 与少量 ALU/分支指令；
 2. **慢路径语义清晰**：同索引创建串行化、结果原子发布、建立时延可配置为 10us/100us/1ms/10ms；
 3. **线程安全**：快路径无锁读，慢路径加锁串行化 + release 发布；
-4. **可度量**：转换开销能被 test.md 的框架精确测量并分解为快路径/慢路径两部分。
+4. **可度量**：转换开销能被 test.md 的框架精确测量并分解为快路径/慢路径两部分；
+5. **双架构一致语义**：提供 x86-64 与 aarch64（ARMv9 + SVE2）两个实现版本（readme 要求），
+   暴露同一公共 API 与语义，仅快路径指令形态按架构取最优（x86-64：BMI2；
+   aarch64：标量 + SVE2 批量），由 test.md 的统一测试框架覆盖两架构、结果可直接对比。
 
 ## 2. 地址格式与映射模型
 
@@ -118,9 +122,10 @@ entry = (uint64_t)arena + ((uint64_t)region << 32);
 目录结构：
 
 ```
-include/vamap.h            # 公共 API、表项编码、内联转换、平台选择
-src/vamap_runtime.c        # 运行时：init/创建/销毁/时延模拟/区域与锁管理
-src/vamap_arch.c           # （可选）手写汇编快路径
+include/vamap.h            # 公共 API、表项编码、内联转换、架构分发
+                           # （__x86_64__ / __aarch64__ 内联快路径 + 通用 C 回退，两版本同 API 同语义）
+src/vamap_runtime.c        # 运行时（架构无关）：init/创建/销毁/时延模拟/区域与锁管理
+src/vamap_arch.c           # （可选）平台专属汇编快路径（如 SVE2 批量变体独立成文件）
 bench/                     # 测试框架（见 test.md）：harness / patterns / state / timer / runtime / report
 tests/                     # 正确性套件（见 test.md §5）
 scripts/check_fastpath.sh  # objdump 校验快路径指令形态
@@ -191,8 +196,9 @@ orq   %rcx, %rax                ; rax = VA = entry | offset
   取上界）**；
   若构建约定 tag≡0（`VAMAP_FAST_TAG0`），删除 `andl` 后为 **7 条 / 典型 5 uops
   （范围 4–7，端口占用口径同上）**；
-  构建系统以宏 `VAMAP_CONV_INSNS`（x86-64 strict 8 / fast 7；ARM64 5）把该数值暴露给测试框架，
-  供 `instr_per_op` 断言使用（test.md §9.3）；
+  构建系统以宏 `VAMAP_CONV_INSNS`（x86-64 strict 8 / fast 7、BMI2 `shrx` 变体 7/6；
+  aarch64 标量 5；SVE2 批量变体取**每批**口径 fast 6 / strict 7，摊销断言见 §5.3 与
+  test.md §9.3）把该数值暴露给测试框架，供 `instr_per_op` 断言使用（test.md §9.3）；
 - 其中 1 条 `mov` 用于把原 vva 保留给慢路径调用：移位是破坏性操作，而慢路径需要
   完整 vva、合并 offset 又需要低 32 位。该复制仅在“由编译器生成、慢路径 ABI 收
   完整 vva”的前提下必要（无 BMI2 也可省去，见下条变体）。若目标平台支持 BMI2，用非破坏性的
@@ -212,7 +218,14 @@ orq   %rcx, %rax                ; rax = VA = entry | offset
 - 若要求 tag 任意取值都不影响结果（readme 的“52 位及以上忽略”），保留 `andl` 作为默认；
   fast 变体必须在分配器或调用约定保证 tag≡0 时使用。
 
-### 5.3 ARM64 目标序列
+### 5.3 aarch64（ARMv9 + SVE2）目标序列
+
+readme 要求的 aarch64 版本面向 ARMv9 + SVE2。查表转换按内核类型提供两种形态：
+**标量形态**（逐访存转换，延迟敏感内核默认）与 **SVE2 批量形态**（每批转换 VL 个
+访存，吞吐型内核最优）。两形态共享同一慢路径函数与运行时，均通过 `include/vamap.h`
+的公共 API 暴露（与 x86-64 版本同 API 同语义）。
+
+#### 标量形态
 
 ```asm
 ; x0 = vva，x19 = vamap_table（表基址）
@@ -228,9 +241,45 @@ bfi  x10, x0, #0, #32           ; 低 32 位插入 offset，保留表项高位
 
 - 不能用 `mov w10, w0` 做合并：32 位写会把 x10 高 32 位清零，丢失表项中的区域基址；
   必须用 `bfi x10, x0, #0, #32`（或 `mov w11, w0` + `orr x10, x10, x11`）保留高位；
-- `ubfx` 天然只取 `[51:32]`，因此 strict 与 fast 在 ARM64 上同为 5 条
+- `ubfx` 天然只取 `[51:32]`，因此 strict 与 fast 在 aarch64 标量形态上同为 5 条
   （acquire 的 `ldar` 与地址计算各 1 条）；若改用 relaxed `ldr`，可省 `add` 并为 4 条，
   但会失去 C11 acquire 语义。
+
+#### SVE2 批量形态（FEAT_SVE2，吞吐型内核最优）
+
+```asm
+; z0.d 内 VL 个 vva（64-bit lane），x19 = vamap_table（表基址），p0 全真
+; —— fast 变体（tag≡0）每批 6 条：
+lsr   z1.d, z0.d, #32                    ; 每 lane 取 vva[63:32]
+and   z1.d, z1.d, #0xFFFFF               ; idx（20 个 1 是合法的 64 位逻辑立即数）
+ld1d  {z2.d}, p0/z, [x19, z1.d, lsl #3]  ; 聚集读表项：每 lane 恰 1 次表 load
+cmpeq p1.d, p0/z, z2.d, #0               ; 无效 lane 整字判零
+b.any .Lslow_batch                       ; 任一 lane 无效 → 慢路径
+orr   z2.d, z2.d, z0.d                   ; fast：tag≡0，直接 OR 合并 offset
+; 以 z2.d 内的 VA 执行向量访存（如 ld1d {z3.d}, p0/z, [z2.d]）
+```
+
+要点：
+
+- **strict 变体 +1 条**：合并前需 `and z3.d, z0.d, #0xFFFFFFFF` 掩掉 tag[63:52]
+  （0x00000000FFFFFFFF 是合法 64 位逻辑立即数），每批 7 条；`orr` 直接带 tag 会把
+  "忽略位"混入 VA，strict 不得省略；
+- **指令摊销**：VL=256 位（4 lane，Neoverse V1/V2 典型值）时 fast ≈ 1.5 条/op
+  （6 ÷ 4）、strict ≈ 1.75 条/op，低于标量形态的 5 条；但 `ld1d` 聚集仍是每访存
+  1 次表项 load，load 端口占用与标量形态相同，节省的是 ALU/分支指令；
+- **无 acquire 聚集 load**：SVE 聚集 load 没有 `ldar` 对应形态。默认实现每批补一条
+  `dmb ishld`（摊销 1/VL 条）恢复 acquire 等效语义；也可按 §7 的地址依赖论证改用
+  relaxed 表项读（转换结果作为后续访存基址形成硬件依赖）；两种方式均在 C4/C5 下验证；
+- **慢路径**：任一 lane 无效时默认**整批退化为标量重执行**（复用标量序列与同一个
+  `vamap_slow_create_fill`，语义与标量形态完全一致）；也可谓词选道 + `lastb`
+  逐 lane 提取 vva 后调用同一函数；
+- **构建与断言**：`-march=armv9-a+sve2` 构建，运行时 `rdvl` 探测实际 VL 并写入结果
+  元数据；`VAMAP_CONV_INSNS` 取每批口径（fast 6 / strict 7），test.md §9.3 的指令
+  断言相应改为 `(instr(B1) − instr(B0)) × VL == VAMAP_CONV_INSNS`；B0 须使用同构
+  向量访存内核，保证差值只含转换指令；
+- **适用范围**：吞吐型内核（T2/T3–T6/T9/T10 的 B1 稳态段）作为 `sve2-batch` 构建
+  变体进入同一矩阵（test.md §3.1）；延迟敏感内核（T1/T8）与正确性语义路径仍以
+  标量形态为准，避免批量边界与首触语义掩盖逐访存转换成本。
 
 ### 5.4 与替代方案的对比（为什么这是最优形态）
 
@@ -250,6 +299,9 @@ bfi  x10, x0, #0, #32           ; 低 32 位插入 offset，保留表项高位
 fast 变体（tag≡0）可省去掩码。表项存完整基址而不是相对 region，避免快路径再承担一次
 `arena` 基址加法；代价是 arena 必须 4 GiB 对齐。
 
+aarch64 上对应的最优形态：标量 5 条（§5.3），吞吐型内核可用 SVE2 批量把 ALU/分支
+摊销到每 lane（表项 load 次数不变）；表项编码与合并方式（OR/bfi）两架构完全一致。
+
 ### 5.5 开销模型（供 test.md 校验）
 
 - 关键路径：`vva →[shr/and 1–2c]→ 表 load（L1 4–5c；L2 约 +14c；LLC 约 +40c；DRAM 约 +100–200c）
@@ -260,7 +312,10 @@ fast 变体（tag≡0）可省去掩码。表项存完整基址而不是相对 r
   在部分微架构上仍占 1 个执行端口）→ 对带宽受限的 STREAM 类内核也会产生可测的
   吞吐下降，这正是测试要量化的部分；
 - 多个独立访存的转换链之间相互独立，乱序执行可跨迭代重叠，摊销部分开销
-  （指针追逐类内核无此摊销，转换延迟完整暴露）。
+  （指针追逐类内核无此摊销，转换延迟完整暴露）；
+- aarch64 标量形态关键路径同构：`ubfx`（1c）→ 表 load（`ldar`）→ `cbz` → `bfi`（1c），
+  L1 命中的串行增量与 x86-64 同阶；SVE2 批量形态把 ALU/分支指令摊销到 VL lane，
+  但每访存仍 1 次表项 load，表 cache 行为不变（§5.3）。
 
 ### 5.6 融合访存的汇编宏（示例：32 位 load）
 
@@ -302,7 +357,9 @@ static inline int32_t vload32(uint64_t vva, const uint64_t *tbl)
 > leaf function 使用 128 B red zone；基准构建须加 `-mno-red-zone`，或把慢路径调用
 > 移到独立的非内联函数，避免 callee 覆盖 red zone 中的 spill。
 
-ARM64 版本同构（`ubfx/add/ldar/cbz/bfi` + `bl vamap_slow_create_fill`）。
+aarch64 标量版本同构（`ubfx/add/ldar/cbz/bfi` + `bl vamap_slow_create_fill`）；
+SVE2 批量变体的融合宏同构（§5.3 的批量序列 + `b.any` 慢路径分支），供吞吐型内核的
+B1/B2 使用。两架构两形态均禁止编译器 CSE 或提升查表。
 64 位元素把末尾的 `movl` 改为 `movq`；store 版把 64 位值操作数写入 `(%%rax)`，
 转换序列与指令数不变。
 
@@ -520,7 +577,8 @@ vamap_map_destroy(idx):
 - 快路径使用 `atomic_load(..., ACQUIRE)`：与发布端 release store 形成 C11
   synchronizes-with，保证表项可见时其先行写入的数据也可见；x86-64 上 acquire load
   就是普通 `mov`，无额外指令；ARM64 上为 `ldar`（LDAR 不支持比例变址，需额外一条
-  `add` 计算地址）；
+  `add` 计算地址）；SVE2 批量形态的聚集 load 无 acquire 变体，按 §5.3 以每批一条
+  `dmb ishld` 补足等效语义或退回地址依赖论证；
 - 表项值作为最终访存的基址，形成硬件级地址/数据依赖，进一步阻止后续数据访问早于
   表项 load 完成；仅依赖 relaxed + 地址依赖在 x86/ARM64 上通常可行，但不满足 C11 的
   happens-before，不能作为可移植实现；
@@ -547,13 +605,17 @@ VSTORE(double, A + i, VLOAD(double, B + i) + q * VLOAD(double, C + i));
   UB；可移植写法是把 VVA 存为 `uintptr_t`/`vva_t` 做整数算术，仅在访存宏内转成指针
   （基准采用后者；上文 `A + i` 仅为示意）；
 - `vamap_pin(vva)` 供流式循环手动提升查表（转换成本上界对照，见 test.md T15）；
-- 编译建议：`-O2 -fno-semantic-interposition`；平台宏选择 x86-64 / ARM64 / 通用 C 回退；
+- 编译建议：`-O2 -fno-semantic-interposition`；平台宏/构建目标选择 x86-64 / aarch64
+  （ARMv9 + SVE2）/ 通用 C 回退——两个实现版本暴露同一公共 API 与语义（readme 要求），
+  仅快路径指令形态随架构不同；aarch64 SVE2 批量变体以 `-march=armv9-a+sve2` 构建，
+  运行时用 `rdvl` 校验实际 VL（§5.3）；
 - 快路径形态校验：`scripts/check_fastpath.sh` 反汇编抽查生成的指令序列是否与 §5.2 一致。
 
 ## 9. 正确性保障
 
 正确性套件（转换位精确性、创建/销毁往返、同索引竞争、TSAN 并发、时延精度、
-churn 压力、alias 引用计数）在 test.md §5 定义，性能测试前必须全部通过作为门槛。
+churn 压力、alias 引用计数）在 test.md §5 定义，性能测试前必须在**每个目标架构**
+（x86-64 与 aarch64）上全部通过作为门槛（readme：统一测试框架覆盖两个实现版本）。
 
 ## 10. 已知限制与扩展方向
 
@@ -562,4 +624,7 @@ churn 压力、alias 引用计数）在 test.md §5 定义，性能测试前必�
   未实现 epoch/hazard-pointer 回收；region 引用计数仅用于 alias 共享（扩展项：epoch 回收）；
 - 未做两级表（8 MiB 单表对 LLC 友好；若缩小索引位宽可重审）；
 - fault 版（§5.7）与 per-core 表、批量预转换、编译器 hoisting 属后续优化空间，
-  均以 test.md T15 的方式量化对比。
+  均以 test.md T15 的方式量化对比；
+- SVE2 批量形态的指令摊销依赖实现的 VL（SVE 允许 128–2048 位），不同 VL 的主机上
+  结果不可直接比较，报告须记录 `rdvl` 实测 VL（test.md §11）；标量与 BMI2 形态
+  不受 VL 影响。
