@@ -73,7 +73,10 @@ entry(idx) == 0 表示该索引尚未建立映射
   17 位相对 region 号宽度保留，便于将来扩展到 `2^49` 地址空间。两种取法对快路径
   指令形态没有影响。
 
-> **规格说明**：readme 原文为"将 VVA 高 51 到 32 位转换成真实的 VA 高 48 到 32 位"。
+> **规格说明**：readme 首句的"48 位虚地址"与同段"32 到 51 位为映射索引"的位段定义
+> 不一致；本设计以位段定义为准（VVA 为 52 位），`strict_48bit` 仅限制真实 VA 落在
+> 48 位以内。readme 关于转换位段的原文为"将 VVA 高 51 到 32 位转换成真实的 VA 高
+> 48 到 32 位"。
 > 本设计用表项存完整区域基址，相对 region 号取 17 位（对应 `VA[48:32]` 的字段宽度）；
 > 若严格要求真实 VA 为 48 位，只需将相对 region 号上限设为 `2^16−1` 并保证
 > `arena + 竞技场 ≤ 2^48`，快路径不变。
@@ -179,11 +182,13 @@ orq   %rcx, %rax                ; rax = VA = entry | offset
 - **合并必须用“零扩展 + OR”两步**：`movl %edi, %ecx` 把 offset 零扩展到 64 位，
   `orq %rcx, %rax` 再与表项高位合并。不能用 `movl %edi, %eax` 代替——32 位写会
   同时清零 rax 高 32 位，把表项中的区域基址丢掉；
-  寄存器-寄存器 `mov` 在多数微架构上可由重命名阶段消除（move elimination，0 执行端口），
-  OR 的关键路径约 1 cycle；
+  用于保留 vva 的 `movq` 在多数微架构上可由重命名阶段消除（move elimination，
+  0 执行端口）；零扩展 `movl` 能否消除取决于微架构。OR 的关键路径约 1 cycle；
 - **test/je 宏融合**为 1 uop；`(%rdx,%rcx,8)` 使用比例变址，无需额外 lea；
-- 指令数：**strict 8 条 / 约 6 uops（循环内）**；若构建约定 tag≡0
-  （`VAMAP_FAST_TAG0`），删除 `andl` 后为 **7 条 / 约 5 uops**；
+- 指令数：**strict 8 条 / 典型 6 uops（范围 5–7；`movq` 通常消除、零扩展 `movl`
+  在部分微架构占 1 个端口，比例变址 load 若计为 2 个 unfused uop 再加 1）**；
+  若构建约定 tag≡0（`VAMAP_FAST_TAG0`），删除 `andl` 后为 **7 条 / 典型 5 uops
+  （范围 4–6）**；
   构建系统以宏 `VAMAP_CONV_INSNS`（x86-64 strict 8 / fast 7；ARM64 5）把该数值暴露给测试框架，
   供 `instr_per_op` 断言使用（test.md §9.3）；
 - 其中 1 条 `mov` 用于把原 vva 保留给慢路径调用：移位是破坏性操作，而慢路径需要
@@ -221,7 +226,7 @@ bfi  x10, x0, #0, #32           ; 低 32 位插入 offset，保留表项高位
 
 | 方案 | 表项编码 | 合并方式 | 快路径（x86-64） | 评价 |
 |------|----------|----------|------------------|------|
-| **本设计** | `arena + region<<32`（完整基址），无效 = 0 | 零扩展 + `or` 合并 | mov/shr/and/load/test+je/mov/or = 8 条（~6 uops；fast 去 and 为 7 条） | 1 次表 load，无独立 valid 位；要求 arena 4 GiB 对齐 |
+| **本设计** | `arena + region<<32`（完整基址），无效 = 0 | 零扩展 + `or` 合并 | mov/shr/and/load/test+je/mov/or = 8 条（典型 6 uops，5–7；fast 去 and 为 7 条） | 1 次表 load，无独立 valid 位；要求 arena 4 GiB 对齐 |
 | 只存相对 region | `region<<32` | 先加 arena 基址再 or | +1 条（共 9 条） | 表项少存基址，但快路径多一次 add/lea；arena=0 时与本设计同价 |
 | 完整基址但未对齐 | 任意 64 位基址 | `and ~0xFFFFFFFF` + or | +1 条（共 9 条：合并前需清低 32 位） | 不要求 4 GiB 对齐，但合并多一条掩码；对齐后即退化为本设计（直接 or） |
 | valid 位放 bit0 | `(arena + region<<32) \| 1` | and+or 掩掉 valid 位 | +1 条（共 9 条：合并前需 `and` 清 bit0） | 判断仍可整字判零（valid 表项恒非零），合并多一条掩码 |
@@ -240,8 +245,9 @@ fast 变体（tag≡0）可省去掩码。表项存完整基址而不是相对 r
   →[零扩展/OR 1c]→ 实际 ld/st（L1 4–5c）`；
 - 表项 L1 命中时，每次访存新增**串行延迟 ≈ 7–8 cycle（strict；fast 6–7）**，分支方向高度可预测；
 - 吞吐层面：每次访存多 1 次 load（占用 load 端口）+ 5 条 ALU/分支（shr、and、test、je、or）
-  + 2 条寄存器复制 `mov`（可被重命名消除，不占执行端口）→ 对带宽受限的
-  STREAM 类内核也会产生可测的吞吐下降，这正是测试要量化的部分；
+  + 2 条寄存器复制 `mov`（保留原 vva 的 `movq` 通常可被重命名消除；零扩展的 `movl`
+  在部分微架构上仍占 1 个执行端口）→ 对带宽受限的 STREAM 类内核也会产生可测的
+  吞吐下降，这正是测试要量化的部分；
 - 多个独立访存的转换链之间相互独立，乱序执行可跨迭代重叠，摊销部分开销
   （指针追逐类内核无此摊销，转换延迟完整暴露）。
 
@@ -308,7 +314,7 @@ typedef uint64_t vva_t;            /* 52 位 VVA；默认实现忽略 bit[63:52]
 typedef struct {
     uint64_t create_latency_ns;   /* 映射建立时延；测试取 10us/100us/1ms/10ms */
     int      latency_mode;        /* VAMAP_LATENCY_SPIN(默认) / VAMAP_LATENCY_SLEEP */
-    uint32_t lock_stripes;        /* 慢路径锁条带数，默认 4096（2 的幂） */
+    uint32_t lock_stripes;        /* 慢路径锁条带数，默认 4096，须为 2 的幂 */
     uint32_t alias_pool_size;     /* bench alias 模式：预留 [1, alias_pool_size] 个 region 供 alias/create 复用；0=禁用（默认），须 < REGION_COUNT */
     int      strict_48bit;        /* 置位时区域号限制在 [1, 2^16-1]（48 位 VA 兼容），并叠加 §2.3 的 arena 上界与 REGION_COUNT-1 */
 } vamap_cfg;
@@ -322,7 +328,9 @@ void     vamap_vva_free(vva_t base, uint32_t nidx);
 int      vamap_map_create(uint32_t idx);  /* 0=成功/已存在；非0=失败；仅实际新建时含模拟时延 */
 int      vamap_map_destroy(uint32_t idx); /* 表项置 0；引用计数归零时回收区域号（无模拟时延） */
 int      vamap_map_alias(uint32_t idx, uint32_t region);
-                                          /* 测试用：预填到已有 region（引用计数 +1），不计时延 */
+                                          /* 测试用：仅对当前无效 idx 预填到已有 region
+                                             （引用计数 +1），不计时延；已有效时返回错误，
+                                             避免覆盖旧表项泄漏引用 */
 
 void     vamap_set_create_latency_ns(uint64_t ns);
 void    *vamap_pin(uint64_t vva);         /* 返回当前 4GiB 窗口真实基址（无效时先创建；供循环提升查表） */
@@ -331,14 +339,16 @@ typedef struct {
     uint64_t creates, destroys;           /* 慢路径事件计数（不含 setup 预填；预热前清零；校验用） */
     uint64_t spin_ns;                     /* 累计模拟时延（仅 create 的 latency 部分） */
     uint64_t slow_ns_total;               /* 全局累计（多线程求和；含锁、分配、模拟时延） */
-    uint64_t fast_hits, slow_calls;
+    uint64_t slow_calls;                  /* 进入慢路径的次数（含 double-check 命中） */
 } vamap_stats;
 vamap_stats vamap_get_stats(void);
 ```
 
-> 计数实现：`creates/destroys/fast_hits/slow_calls/spin_ns/slow_ns_total` 在多线程下用
-> 原子增量（或每线程累加后汇总），`vamap_get_stats` 返回读取时刻的快照；否则 T11/C5
-> 的计数校验会因丢失更新而失败。
+> 计数实现：`creates/destroys/slow_calls/spin_ns/slow_ns_total` 在多线程下用原子增量
+> （或每线程累加后汇总），`vamap_get_stats` 返回读取时刻的快照；否则 T11/C5 的计数
+> 校验会因丢失更新而失败。**快路径不写任何计数**（否则会破坏 §5.2 的 8 条快路径）；
+> `fast_hits` 由测试框架按"逐次转换内核的总 ld/st 数 − slow_calls"导出（T15 hoist
+> 版按实际转换点数另记），报告口径见 test.md §9.1。
 
 ### 6.2 地址空间预留
 
@@ -371,15 +381,22 @@ vamap_stats vamap_get_stats(void);
   `region 号上界 ≤ floor((2^48 − arena)/4 GiB) − 1`；再叠加 `2^16−1` 的分配上限。
   因此严格模式可用的 region 号上界为
   `min(2^16−1, REGION_COUNT−1, floor((2^48 − arena)/4 GiB) − 1)`，仅当 arena 足够低时
-  才可能达到 `2^16−1`；若释放后产生空洞，仍以已分配的最大 region 号为准。若
-  `arena ≥ 2^48`，严格模式无法建立任何映射，`vamap_init` 应返回错误（而不是让差值
-  无符号回绕）；
+  才可能达到 `2^16−1`；若释放后产生空洞，仍以已分配的最大 region 号为准。严格模式下
+  竞技场**预留规模**也要按候选 hint 先截到
+  `min(REGION_COUNT, 2^16, floor((2^48 − hint)/4 GiB))`（否则 LA57 的 512 TiB 竞技场
+  本体就无法落在 `2^48` 以下）；预留后若实际 arena 不满足上界，则缩小规模重试或失败。若
+  `floor((2^48 − arena)/4 GiB) − 1 < 1`（即 arena 距 `2^48` 不足 8 GiB，含
+  `arena ≥ 2^48`），严格模式连 region 1 都无法容纳，`vamap_init` 应返回错误
+  （而不是让差值无符号回绕）。严格模式预留时应优先向内核请求 `2^48` 以下的地址
+  （mmap hint / `MAP_FIXED_NOREPLACE`），仅在无法满足时失败；不能假定默认 mmap
+  在 LA57 等平台一定返回低地址；
 - 可用 region 数（上限 `2^17−1`，平台相关，见上表；严格 48 位模式再叠加 `2^16−1` 分配上限）
   恒小于表项数 `2^20`；需要“全表有效”时测试框架用 `vamap_map_alias` 预填到少量 region，
   正常创建在 region 耗尽时返回错误；
 - **bench 专用 region 池**（`alias` 模式）：测试框架设 `cfg.alias_pool_size = 64`，
   `vamap_init` 预留 region 号 `[1, 64]` 作为固定池（引用计数）；普通模式下
-  `region_alloc` 跳过该区间，alias 模式下 `vamap_map_create` 改为从池中按轮转/引用计数取用
+  `region_alloc` 跳过该区间，alias 模式下 `region_alloc`（`vamap_map_create` 与
+  `vamap_slow_create_fill` 共用）改为从池中按轮转/引用计数取用
   （不消耗池外新 region）；`vamap_map_alias(idx, region)` 把大量表项预填到池内 region，
   从而支持在 `2^20` 表项上测非零无效比例而不耗尽 region 号；
   create 仍正常计数并执行时延模拟。该池复用模式中任意数据别名只用于性能测量；
@@ -399,8 +416,11 @@ vamap_stats vamap_get_stats(void);
 ### 6.3 慢路径：映射创建与表项填充
 
 ```c
+/* 以下为 SPIN 模式；SLEEP 模式须把 lock/unlock 换成可睡眠互斥锁，
+   不得持有自旋锁进入 clock_nanosleep（见下方第 4 点）。 */
 void *vamap_slow_create_fill(uint64_t vva)
 {
+    atomic_inc(&stats.slow_calls);                               /* 仅慢路径计数，快路径不写 */
     uint32_t idx = (uint32_t)(vva >> 32) & 0xFFFFFu;
     lock_t  *lk  = &locks[idx & (cfg.lock_stripes - 1)];
 
@@ -449,7 +469,10 @@ vamap_map_destroy(idx):
     atomic_store_explicit(&vamap_table[idx], 0, memory_order_release);
     if (e) {
         uint32_t r = (uint32_t)((e - (uint64_t)arena) >> 32);
-        if (region_unref(r) == 0) region_free(r);
+        if (region_unref(r) == 0) {
+            if (is_pool_region(r)) pool_release(r);   /* 留在池中，引用计数归零待复用 */
+            else                   region_free(r);    /* 普通 region 归还空闲链 */
+        }
     }
     unlock(stripe);
 ```
@@ -457,7 +480,8 @@ vamap_map_destroy(idx):
 - 销毁**不含模拟时延**（readme 只要求建立时延可配）；
 - **alias 共享 region**：多个 idx 可经 `vamap_map_alias` 指向同一 region，因此区域号需
   维护引用计数；只有最后一个引用销毁时才回收，否则单个 alias 表项销毁会误回收其他
-  idx 仍在使用的区域；
+  idx 仍在使用的区域。池内 region 的"回收"只是引用计数归零并保留在池中供下次
+  `region_alloc` 复用，**不得**通过 `region_free` 归还给普通分配器（池区间始终保留）；
 - **竞态约束**：销毁与该映射的并发使用者之间需外部同步。mock 中区域内存映射在进程
   生命周期内保留，不会 use-after-free；但区域号回收复用后，在途的旧转换结果
   可能指向新映射的内存。测试框架的 churn 场景遵守"阶段边界销毁"或
@@ -508,7 +532,9 @@ VSTORE(double, A + i, VLOAD(double, B + i) + q * VLOAD(double, C + i));
 
 - **对 VVA 的指针算术无需转换**：idx/offset 分段使 `base + i*8` 在 4 GiB 内自然成立；
   跨越 4 GiB 边界时索引 +1，前提是目标索引已建立映射（`vamap_vva_alloc(n)` 支持一次
-  分配连续 n 个索引供巨数组使用）；
+  分配连续 n 个索引供巨数组使用）。严格按 C 标准，对未指向真实对象的指针做算术是
+  UB；可移植写法是把 VVA 存为 `uintptr_t`/`vva_t` 做整数算术，仅在访存宏内转成指针
+  （基准采用后者；上文 `A + i` 仅为示意）；
 - `vamap_pin(vva)` 供流式循环手动提升查表（转换成本上界对照，见 test.md T15）；
 - 编译建议：`-O2 -fno-semantic-interposition`；平台宏选择 x86-64 / ARM64 / 通用 C 回退；
 - 快路径形态校验：`scripts/check_fastpath.sh` 反汇编抽查生成的指令序列是否与 §5.2 一致。
